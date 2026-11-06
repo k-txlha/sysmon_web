@@ -23,7 +23,7 @@ Exact supported versions, minimum hardware requirements, operating-system covera
 
 ## Repository setup
 
-The canonical EDR repository URL is not included in this workspace, so a clone command cannot be provided safely. The checked-out project here is the website: its Vite scripts are in `package.json`, page code is in `src/`, and static brand assets are in `assets/`.
+The canonical EDR repository URL is not included in this workspace, so a clone command cannot be provided safely. The checked-out project here is the website: its Vite scripts are in `package.json`, page code is in `src/`, source exports are in `assets/`, and website SVGs are served from `public/assets/`.
 
 The website's `npm install` and `npm run dev` commands are not substitutes for EDR dependency installation or backend startup instructions.
 

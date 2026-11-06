@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const chartBars = [
   20, 29, 24, 35, 29, 39, 27, 44, 34, 41, 28, 48, 36, 44, 39, 52, 33, 48,
@@ -130,7 +130,16 @@ const endpointRows = [
   ["HR-EMPLOYEE-07", "Windows 11", "Offline", "08:12:16"],
 ];
 
-const pipeline = ["Endpoint Agent", "API Gateway", "Event Processing", "Storage", "Dashboard"];
+const pipeline = [
+  { title: "Endpoint Agent", details: ["Telemetry", "Offline Buffer"] },
+  { title: "Caddy / TLS", details: ["HTTPS", "Security"] },
+  { title: "FastAPI Gateway", details: ["Auth", "Tenant ID"] },
+  { title: "Apache Kafka", details: ["Event Transport"] },
+  { title: "Processing Workers", details: ["Validate", "Normalize"] },
+  { title: "Detection Engine", details: ["YAML Rules", "Alert Generation"] },
+  { title: "Storage", details: ["ClickHouse", "PostgreSQL"] },
+  { title: "Dashboard", details: ["Devices / Events", "Alerts"] },
+];
 
 function Arrow({ diagonal = false }: { diagonal?: boolean }) {
   return (
@@ -483,6 +492,40 @@ function ProductShowcase() {
 }
 
 function HowItWorks() {
+  const pipelineRef = useRef<HTMLDivElement>(null);
+  const [pipelineScrollState, setPipelineScrollState] = useState({ left: false, right: false });
+
+  useEffect(() => {
+    const pipeline = pipelineRef.current;
+    if (!pipeline) return;
+
+    const updateScrollState = () => {
+      setPipelineScrollState({
+        left: pipeline.scrollLeft > 1,
+        right: pipeline.scrollLeft + pipeline.clientWidth < pipeline.scrollWidth - 1,
+      });
+    };
+
+    updateScrollState();
+    pipeline.addEventListener("scroll", updateScrollState, { passive: true });
+    window.addEventListener("resize", updateScrollState);
+
+    return () => {
+      pipeline.removeEventListener("scroll", updateScrollState);
+      window.removeEventListener("resize", updateScrollState);
+    };
+  }, []);
+
+  const scrollPipeline = (direction: -1 | 1) => {
+    const pipeline = pipelineRef.current;
+    if (!pipeline) return;
+
+    pipeline.scrollBy({
+      left: direction * pipeline.clientWidth * 0.8,
+      behavior: "smooth",
+    });
+  };
+
   const steps = [
     ["01", "Endpoint Agent", "A lightweight agent collects endpoint activity close to the source."],
     ["02", "Secure Communication", "Authenticated, encrypted connections carry telemetry to the platform."],
@@ -506,11 +549,39 @@ function HowItWorks() {
         ))}
       </div>
       <div className="pipeline">
-        <p>DESIGNED DATA FLOW / PLANNED</p>
-        <div className="pipeline-steps">
+        <div className="pipeline-heading">
+          <p>DESIGNED DATA FLOW / PLANNED</p>
+          <div className="pipeline-scroll-controls" aria-label="Scroll data flow diagram">
+            <button
+              aria-controls="telemetry-pipeline"
+              aria-label="Scroll diagram left"
+              className="pipeline-scroll-button"
+              disabled={!pipelineScrollState.left}
+              onClick={() => scrollPipeline(-1)}
+              type="button"
+            >
+              <span aria-hidden="true">←</span>
+            </button>
+            <span className="pipeline-scroll-label">SCROLL</span>
+            <button
+              aria-controls="telemetry-pipeline"
+              aria-label="Scroll diagram right"
+              className="pipeline-scroll-button"
+              disabled={!pipelineScrollState.right}
+              onClick={() => scrollPipeline(1)}
+              type="button"
+            >
+              <span aria-hidden="true">→</span>
+            </button>
+          </div>
+        </div>
+        <div className="pipeline-steps" id="telemetry-pipeline" ref={pipelineRef}>
           {pipeline.map((item, index) => (
-            <div className="pipeline-part" key={item}>
-              <span>{item}</span>
+            <div className="pipeline-part" key={item.title}>
+              <div className="pipeline-node">
+                <strong>{item.title}</strong>
+                <span>{item.details.map((detail) => <span key={detail}>{detail}</span>)}</span>
+              </div>
               {index < pipeline.length - 1 && <Arrow />}
             </div>
           ))}
