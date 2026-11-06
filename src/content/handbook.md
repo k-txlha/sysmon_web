@@ -1106,7 +1106,22 @@ The deployment roadmap includes:
 # 14. Technology Stack
 The following technologies are part of the current or intended SysMon architecture.
 
-TechnologyResponsibilityPythonAgent and backend developmentFastAPIBackend API and ingestion gatewaypsutilProcess and system telemetry collectionApache KafkaEvent transport and asynchronous processingClickHouseHigh-volume telemetry storage and analyticsPostgreSQLStructured application-state storageSQLiteEarlier administrative storage decisionRedis / ValkeyToken-related and operational stateYAMLDetection rule definitionsDockerContainerizationDocker ComposeMulti-service deploymentCaddyPlanned TLS termination and reverse proxyNot every technology listed above is necessarily active in every deployment configuration.
+| Technology | Responsibility |
+| --- | --- |
+| Python | Agent and backend development |
+| FastAPI | Backend API and ingestion gateway |
+| psutil | Process and system telemetry collection |
+| Apache Kafka | Event transport and asynchronous processing |
+| ClickHouse | High-volume telemetry storage and analytics |
+| PostgreSQL | Structured application-state storage |
+| SQLite | Earlier administrative storage decision |
+| Redis / Valkey | Token-related and operational state |
+| YAML | Detection rule definitions |
+| Docker | Containerization |
+| Docker Compose | Multi-service deployment |
+| Caddy | Planned TLS termination and reverse proxy |
+
+Not every technology listed above is necessarily active in every deployment configuration.
 
 ---
 
