@@ -492,7 +492,7 @@ function DocArticle({
         {page.source === "installation" && (
           <div className="docs-accuracy-callout" role="note">
             <span>!</span>
-            <p><strong>Implementation details are unverified.</strong> This workspace contains the Vite website, not the EDR backend, endpoint agent, or deployment configuration. Missing commands and schemas are intentionally not invented.</p>
+            <p>SysMon is actively under development. Platform-specific installation instructions and deployment requirements are being validated. Detailed setup guides will be published as they become available.</p>
           </div>
         )}
         {page.slug === "api-reference/overview" && (

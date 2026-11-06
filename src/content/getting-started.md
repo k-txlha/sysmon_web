@@ -2,19 +2,6 @@
 
 This guide separates steps that are runnable in this website checkout from the EDR deployment workflow described in the supplied project handbook. The current workspace contains the Vite website and its assets; it does not contain a SysMon backend, endpoint agent, worker, Docker Compose file, or service configuration.
 
-> **Important:** Do not use this page as a production deployment recipe. The EDR installation commands, service names, environment variables, enrollment script location, and agent service definitions cannot be verified from this checkout.
-
-## What you can run from this checkout
-
-The following commands run the documentation website only. They do not start an EDR backend, Kafka, a worker, or an endpoint agent.
-
-```bash
-npm install
-npm run dev
-```
-
-Open the local address printed by Vite (by default, `http://localhost:5173`). The package manifest does not declare a minimum Node.js version.
-
 ## EDR prerequisites
 
 The handbook describes a self-hosted architecture using Python services and endpoint agents, Docker and Docker Compose, Kafka, ClickHouse, PostgreSQL, SQLite, Redis/Valkey, and a web dashboard. Caddy is described as the intended TLS reverse proxy.
