@@ -3,1498 +3,851 @@
 ## Open-Source Endpoint Detection & Response (EDR)
 **Product Documentation & Technical Handbook**
 
-Version: 0.1 — Development Documentation
-Product name: SysMon (temporary name)
-Deployment model: Self-hosted / On-premises
-Product category: Endpoint Detection and Response (EDR)
-Documentation status: Living document
+Version: 0.1 — Development Documentation  
+Product name: SysMon (temporary working name)  
+Deployment model: Self-hosted / On-premises  
+Product category: Endpoint Detection and Response (EDR) Prototype  
+Audit date: 2026-11-06 · 118 Verified Unit/API Tests Passing  
+Documentation status: Master Technical Handbook based on Repository Source Audit
 
 ---
 
 # 1. Introduction
 
 ## 1.1 What is SysMon?
-SysMon is an open-source, self-hosted Endpoint Detection and Response (EDR) platform designed to provide organizations with visibility into their endpoint devices, system activities, and potentially suspicious behavior.
+SysMon is an open-source, self-hosted Endpoint Detection and Response (EDR) platform prototype designed to provide organizations with visibility into their endpoint devices, process activities, and authentication behavior.
 
-It aims to make endpoint monitoring and security investigation accessible to startups and smaller organizations that cannot afford expensive enterprise security platforms.
+It aims to make endpoint telemetry collection and security investigation accessible to startups, smaller organizations, and security researchers who cannot afford expensive commercial security suites.
 
-SysMon collects endpoint telemetry through lightweight agents installed on monitored devices. The collected information is securely transmitted to a centralized backend, processed through an event pipeline, evaluated against detection rules, and made available to security analysts through a centralized dashboard.
+SysMon collects telemetry through lightweight Python agents installed on monitored endpoints (Windows, Linux, macOS). The collected information is buffered locally in SQLite, transmitted securely over HTTPS to a FastAPI gateway, published into an Apache Kafka message stream, processed by background workers, evaluated against detection rules, and persisted in ClickHouse MergeTree tables for administrative investigation.
 
-Unlike a cloud-dependent security platform, SysMon is designed around a self-hosted deployment model. Organizations own their infrastructure and retain control over their collected security data.
+Unlike cloud-managed security platforms that export sensitive telemetry to third parties, SysMon is designed around a self-hosted architecture where organizations retain complete sovereignty over their telemetry.
 
-## 1.2 Why SysMon?
-Organizations need visibility into what happens across their computers and servers.
+## 1.2 System Maturity & Status
+SysMon is currently an **early functional prototype**, not a production-ready enterprise EDR deployment.
 
-Without endpoint monitoring, it becomes difficult to answer questions such as:
+The codebase implements a working sensor, versioned event envelopes, local bounded queuing, an HTTPS FastAPI gateway, one-time bootstrap enrollment, 1-hour rotating bearer credentials, a Kafka producer/consumer pipeline, ClickHouse analytical tables, a YAML-based authentication detection engine, and alert dispatchers (Slack, Discord, SMTP).
 
-- Which processes are currently running?
-- Which user started a particular process?
-- What parent process created it?
-- When did a process start or terminate?
-- Which authentication activities are occurring?
-- Are there suspicious changes to system persistence mechanisms?
-- Are unauthorized changes happening on monitored endpoints?
-- Which devices are experiencing unusual activity?
-- Which security events require investigation?
-Traditional enterprise EDR platforms can be expensive and operationally complex.
+However, important end-to-end gaps remain:
+1. The sensor emits process lifecycle events (`process.snapshot`, `process.start`, `process.exit`), but the current worker does not yet persist them to ClickHouse.
+2. Tenant isolation in ClickHouse tables and dashboard queries is not yet implemented (all enrollments are assigned to a single default tenant).
+3. The worker does not couple Kafka offset commits with ClickHouse transaction success, meaning database failures during batch insertion can lose consumed events.
 
-SysMon aims to provide an accessible foundation for endpoint visibility, telemetry collection, centralized detection, and security investigation.
+Every capability in this handbook is qualified to distinguish verified implementation from planned future work.
 
-## 1.3 Product objectives
-The primary objectives are:
-
-1. Provide lightweight endpoint monitoring.
-2. Collect structured telemetry from different operating systems.
-3. Centralize endpoint data through a scalable backend.
-4. Support multiple organizations through tenant isolation.
-5. Detect suspicious activities through configurable rules.
-6. Provide centralized alert management.
-7. Enable analysts to investigate endpoint activities.
-8. Support self-hosted deployments.
-9. Minimize infrastructure and operational complexity.
-10. Remain open-source and extensible.
-
-## 1.4 Target audience
+## 1.3 Target Audience
 SysMon is primarily intended for:
-
-- Startups.
-- Small and medium-sized businesses.
-- Organizations with limited security budgets.
-- Infrastructure and IT administrators.
-- Security operations teams.
-- Independent security researchers.
-- Developers building security monitoring infrastructure.
+- Startups and growing engineering teams.
+- Small and medium-sized organizations with limited security budgets.
+- Infrastructure and DevOps engineers needing self-hosted endpoint visibility.
+- Security operations teams building custom detection pipelines.
+- Independent security researchers and developers studying EDR architecture.
 
 ---
 
 # 2. Core Concepts
-Understanding these concepts is important before deploying or operating SysMon.
+
+Understanding these core concepts is essential for deploying, evaluating, and contributing to SysMon:
 
 ## 2.1 Endpoint
-An endpoint is an individual device monitored by SysMon.
+An endpoint is any physical or virtual machine running an operating system monitored by SysMon (Windows workstations, Linux cloud instances, macOS developer laptops). Monitored endpoints run the agent process.
 
-Examples include:
+## 2.2 Agent / Sensor
+The SysMon Agent is a cross-platform Python background process (or OS service) installed on the endpoint. It polls host metrics, captures process start/exit diffs, computes SHA-256 binary fingerprints, parses platform authentication logs, enqueues events into a local SQLite database, and ships batches to the backend gateway.
 
-- Windows workstations.
-- Linux servers.
-- macOS computers.
-Each enrolled endpoint is represented by a registered agent in the central platform.
+## 2.3 EventEnvelope
+The canonical data contract used for all telemetry. Every event is wrapped in a versioned Pydantic model containing client-generated UUID `event_id`, integer `schema_version`, `tenant_id`, `host_id`, `agent_id`, `event_type`, `observed_at` UTC timestamp, monotonic `sequence` counter, `severity` level, and event-specific `data` payload.
 
-## 2.2 Agent
-The SysMon Agent is a lightweight background service installed on an endpoint.
+## 2.4 Bootstrap Token vs. Operational Token
+SysMon enforces a two-stage credential lifecycle:
+- **Bootstrap Token:** A short-lived (30-minute), single-use token generated by an administrator via `POST /api/v1/agents/token` used solely for initial agent enrollment.
+- **Operational Agent Token:** A rotating bearer token valid for 1 hour, issued by the backend at enrollment and automatically rotated in a background thread every 55 minutes via `POST /api/v1/agents/renew`.
 
-Its responsibilities include:
+## 2.5 Local Bounded Buffer
+A local SQLite database on the endpoint (`agent/.agent_buffer.db`) configured with Write-Ahead Logging (WAL) and `synchronous=FULL`. It guarantees durability across network disconnections and host power cuts, bounded by a 25,000 event / 50 MiB ceiling with FIFO eviction and 7-day retention.
 
-- Identifying the operating system.
-- Collecting system information.
-- Collecting process telemetry.
-- Collecting authentication-related telemetry.
-- Tracking process lifecycle changes.
-- Normalizing collected information.
-- Creating structured telemetry events.
-- Buffering events when the backend is unavailable.
-- Transmitting telemetry to the backend.
-- Maintaining its authentication credentials.
-The agent is intended to operate without requiring users to manually start it every time they use their computers.
+## 2.6 Tenant ID
+An identity metadata string attached to enrolled agents and telemetry envelopes. The backend server binds enrollments to `DEFAULT_TENANT_ID`. Note: while metadata validation exists at ingestion, tenant isolation in storage and queries is not yet implemented.
 
-## 2.3 Tenant
-A tenant represents an individual organization using SysMon.
-
-Each tenant has its own logically isolated environment.
-
-For example:
-
-- Organization A has its own endpoints, alerts, and telemetry.
-- Organization B has its own endpoints, alerts, and telemetry.
-Both organizations may use the same SysMon backend deployment, but their data must remain logically separated.
-
-## 2.4 Telemetry
-Telemetry refers to structured information collected from monitored endpoints.
-
-Examples include:
-
-- Process creation.
-- Process termination.
-- System information.
-- Authentication activity.
-- Endpoint health information.
-Telemetry provides the raw information required for detection and investigation.
-
-## 2.5 Detection Rule
-A detection rule defines conditions that identify potentially suspicious activities.
-
-Rules are evaluated by the backend detection engine rather than being embedded in the endpoint agent.
-
-This allows detection logic to be updated centrally without requiring every endpoint agent to receive new detection code.
-
-## 2.6 Alert
-An alert is a security finding generated when collected telemetry satisfies a detection rule.
-
-Alerts are stored centrally and made available to analysts through the dashboard.
-
-## 2.7 Event
-An event is an individual structured record describing something that happened on an endpoint.
-
-SysMon uses a common event envelope to maintain consistency between different telemetry sources.
+## 2.7 Detection Rules & Fired Alerts
+Worker-side rules defined in YAML that evaluate incoming authentication events against threshold counts, pattern watchlists, or UTC time windows. When triggered, a structured `FiredAlert` record is written to ClickHouse and dispatched to configured webhooks (Slack, Discord, SMTP).
 
 ---
 
 # 3. System Architecture
 
-## 3.1 High-level architecture
-SysMon follows a distributed architecture consisting of endpoint agents, an ingestion backend, an event-processing pipeline, persistent storage, and a centralized dashboard.
+## 3.1 Architecture Overview
+The SysMon architecture is divided into five logical subsystems:
 
-The intended high-level data flow is:
-
+```text
+[ Monitored Endpoint ]
+   Collectors (Metrics / Processes / Auth Logs)
+   TelemetryAssembler (EventEnvelope v1)
+   LocalBoundedBuffer (SQLite WAL Queue)
+   TokenManager (1h Rotating Bearer Credentials)
+        │
+        ▼ HTTPS POST /api/v1/telemetry
+[ FastAPI Ingestion Gateway (:8000) ]
+   Bearer Auth Check · Pydantic Validation
+   SQLite Deduplication Receipts (telemetry_receipts)
+   aiokafka Producer (acks="all", idempotent=True)
+        │
+        ▼ Kafka Topic: telemetry_data
+[ Apache Kafka KRaft Cluster ]
+   3 Controllers + 3 Brokers (ports 29092, 39092, 49092)
+        │
+        ▼ Consumer Group
+[ Processing & Detection Worker ]
+   Batch Ingestion (1000 items / 5s flush)
+   YAML Detection Engine (7 Login Rules)
+   Alert Dispatcher (Slack / Discord / SMTP)
+        │
+        ▼ HTTP Native Client (:8123)
+[ ClickHouse Columnar Storage ]
+   DEVICES · EVENTS · ALERTS · AGENT_HEALTH
 ```
-                MONITORED ENDPOINTS
-              +----------------------+
-              |                      |
-              |   Windows Agent      |
-              |   Linux Agent        |
-              |   macOS Agent        |
-              |                      |
-              +----------+-----------+
-                         |
-                         |
-                 Structured Telemetry
-                         |
-                         v
-              +----------------------+
-              |   FastAPI Gateway    |
-              |                      |
-              | Authentication       |
-              | Validation           |
-              | Enrollment           |
-              | Ingestion            |
-              +----------+-----------+
-                         |
-                         v
-              +----------------------+
-              |        Kafka         |
-              |                      |
-              | Telemetry Transport  |
-              | Buffering            |
-              | Event Distribution   |
-              +----------+-----------+
-                         |
-                         v
-              +----------------------+
-              | Processing Workers   |
-              |                      |
-              | Event Processing     |
-              | Normalization        |
-              | Detection Rules      |
-              | Correlation          |
-              +----------+-----------+
-                         |
-                 +-------+-------+
-                 |               |
-                 v               v
-          +-------------+  +-------------+
-          | ClickHouse  |  | Alert Store |
-          |             |  |             |
-          | Telemetry   |  | Alerts      |
-          | Events      |  | Findings    |
-          +-------------+  +-------------+
-                 |               |
-                 +-------+-------+
-                         |
-                         v
-              +----------------------+
-              |   SysMon Dashboard   |
-              |                      |
-              | Devices              |
-              | Events               |
-              | Alerts               |
-              | Investigation        |
-              +----------------------+
-```
-This diagram represents the intended architecture. Not every component or data flow is fully operational yet.
 
-## 3.2 Endpoint agent layer
-The endpoint agent is responsible for collecting information directly from monitored devices.
+## 3.2 Endpoint Sensor Subsystem
+The agent process runs continuously on the endpoint:
+1. **SystemCollector:** Collects CPU utilization %, RAM usage, primary IP, and MAC address.
+2. **ProcessCollector:** Uses `psutil` to inspect running processes, capturing PID, PPID, name, executable path, command line, username, working directory, and SHA-256 binary hash. It diffs running PIDs against a previous snapshot to emit `process.start` and `process.exit` events.
+3. **OSCollector:** Parses platform-specific authentication records (Windows Security Event Log IDs 4624/4625 via `pywin32`; Linux `/var/log/auth.log` or `journalctl`; macOS `log show`).
+4. **Assembler & Buffer:** Wraps payloads in `EventEnvelope`, increments sequence counters, and writes records into the local SQLite WAL queue.
+5. **Transport & Renewer:** Sends batches of up to 50 events over HTTPS with exponential retry backoff, while a background thread renews the 1-hour agent token.
 
-The agent:
+## 3.3 Backend API Gateway Subsystem
+Built with FastAPI and Uvicorn, the gateway mounts 8 routers registering 30 HTTP operations:
+- **Lifespan Manager:** Connects the aiokafka producer and initializes ClickHouse query clients on startup; cleans up on shutdown.
+- **Security & Rate Limiting:** Enforces HTTPS transport, checks bearer agent tokens, validates admin sessions (Argon2id, HttpOnly SameSite Strict cookies, CSRF tokens), and enforces rate limits (Valkey or process-local memory).
+- **Ingestion & Deduplication:** Rejects invalid envelopes, checks that envelope tenant/agent IDs match authenticated credentials, stamps `received_at`, filters duplicate IDs using SQLite `telemetry_receipts`, publishes to Kafka with `acks="all"`, and responds `202 Accepted`.
 
-1. Detects the host operating system.
-2. Selects the appropriate platform-specific collectors.
-3. Collects endpoint information.
-4. Tracks changes between collection cycles where applicable.
-5. Converts platform-specific information into structured events.
-6. Adds event metadata.
-7. Buffers events when transmission is unavailable.
-8. Sends telemetry to the backend.
-The architecture separates platform-specific collection from platform-independent event representation.
+## 3.4 Messaging Subsystem (Apache Kafka)
+SysMon uses an Apache Kafka cluster running in modern KRaft mode (no ZooKeeper dependency):
+- 3 controllers and 3 brokers exposing host ports `29092`, `39092`, and `49092`.
+- Default topic: `telemetry_data`.
+- Message key: `agent_id:event_id` ensuring per-agent partition affinity.
+- Producer configuration: `acks="all"`, `enable_idempotence=True`, gzip compression.
 
-This allows different operating systems to produce a common event structure.
+## 3.5 Processing & Detection Worker Subsystem
+A dedicated Python worker (`python -m worker.main`) consumes from Kafka:
+- Buffers up to 1,000 records or flushes every 5 seconds.
+- Deserializes JSON payloads and routes supported types to ClickHouse tables.
+- Evaluates authentication rows against enabled YAML detection rules.
+- Commits fired alerts to the `ALERTS` table and fans out notifications via Slack, Discord, or SMTP email.
 
-## 3.3 API gateway
-The backend gateway is built using Python and FastAPI.
-
-Its responsibilities include:
-
-- Agent authentication.
-- Agent enrollment.
-- Token validation.
-- Request validation.
-- Telemetry ingestion.
-- Agent health communication.
-- Forwarding accepted telemetry into the event pipeline.
-The gateway provides the communication boundary between endpoint agents and the centralized backend.
-
-## 3.4 Message broker
-SysMon uses Apache Kafka as its event transport layer.
-
-Kafka separates telemetry ingestion from downstream processing.
-
-Instead of requiring the API gateway to perform all processing synchronously, accepted events can be published to Kafka for asynchronous consumption.
-
-Benefits include:
-
-- Decoupled services.
-- Asynchronous event processing.
-- Independent scaling of consumers.
-- Buffering during temporary processing interruptions.
-- Improved throughput handling.
-- Reduced coupling between ingestion and detection services.
-The existing project has used the Kafka topic:
-
-`normalized.connector_data_1`
-
-The final production topic structure and partition strategy remain subject to implementation.
-
-## 3.5 Processing workers
-Processing workers consume telemetry from Kafka.
-
-The intended responsibilities include:
-
-- Reading telemetry messages.
-- Validating event structure.
-- Processing normalized events.
-- Evaluating YAML-based detection rules.
-- Maintaining detection state where necessary.
-- Deduplicating repeated findings.
-- Correlating related events.
-- Generating alerts.
-- Persisting alerts.
-- Triggering notification workflows.
-Detection logic is maintained centrally in the worker layer.
-
-The endpoint agent is responsible for collecting telemetry, not independently deciding whether an event is malicious.
-
-## 3.6 Storage architecture
-SysMon uses different storage technologies for different workloads.
-
-### ClickHouse
-ClickHouse is intended for high-volume telemetry and analytical queries.
-
-Its responsibilities include:
-
-- Storing endpoint events.
-- Supporting time-based queries.
-- Retrieving historical telemetry.
-- Supporting event investigation.
-- Enabling analytical queries across large event datasets.
-ClickHouse is selected because it is designed for analytical workloads and large volumes of structured event data.
-
-### PostgreSQL
-PostgreSQL is part of the broader product-state architecture.
-
-It is intended for structured application data and operational records that are not best suited to analytical event storage.
-
-The exact final ownership of product-state tables and migration from earlier storage decisions should be documented alongside the implementation.
-
-### SQLite
-SQLite was selected in the earlier architecture decisions for administrative storage.
-
-Its exact role in the final deployment must remain consistent with the actual repository implementation.
-
-### Redis / Valkey
-Redis-compatible storage has been used in the project for token-related state and related operational functionality.
-
-Valkey has also been considered for rate limiting and backpressure management.
-
-Do not assume that every proposed storage responsibility is active in the current deployment.
+## 3.6 Storage Architecture
+SysMon uses a dual-store database architecture:
+- **SQLite (`data/sysmon_auth.db`):** Handles transactional state for administrative users (`admin_users`), sessions (`admin_sessions`), agent records (`agents`), credentials (`agent_credentials`), and deduplication receipts (`telemetry_receipts`).
+- **ClickHouse (`metrics` database):** Columnar `MergeTree` analytical engine for telemetry tables: `DEVICES`, `EVENTS`, `ALERTS`, and `AGENT_HEALTH`.
+- **Note on PostgreSQL & Caddy:** PostgreSQL and Caddy are not present in the current codebase; earlier references were planning concepts.
 
 ---
 
 # 4. Endpoint Agent
 
-## 4.1 Overview
-The SysMon Agent is the component installed on each monitored endpoint.
+## 4.1 Overview & Execution Loop
+The agent entry point is `agent/main.py`. When launched:
+1. Verifies that `SIEM_AGENT_ID` and `SIEM_AGENT_TOKEN` exist in configuration; exits with an error if unenrolled.
+2. Initializes `AgentTokenManager` and launches the background renewal thread.
+3. Initializes `LocalBoundedBuffer` (SQLite).
+4. Enters collection loop polling at `SIEM_COLLECTION_INTERVAL` (default 5s).
+5. Assembles envelopes, writes to local queue, and calls `ship_to_backend()` to drain pending batches.
 
-It runs as a background service and collects information about the host and its activities.
+## 4.2 Host & System Information Collection
+`SystemCollector` (`agent/collectors/common.py`) gathers:
+- Hostname, primary IP address (resolved via UDP socket connect probe without sending packet data), and MAC address.
+- CPU core count and system-wide CPU percentage.
+- Total memory and available memory via `psutil.virtual_memory()`.
+- Operating system platform, kernel release, and machine architecture.
 
-The design aims to keep the agent lightweight and independent of the backend's detection logic.
+## 4.3 Process Telemetry & SHA-256 Fingerprinting
+`ProcessCollector` (`agent/collectors/process.py`) inspects processes:
+- **Process Lineage:** Extracts `pid` and `ppid` to enable parent-child process tree reconstruction.
+- **Execution Arguments:** Captures command-line array without artificial truncation.
+- **Start Time:** Converts process creation timestamp to UTC ISO-8601 string.
+- **Binary Hashing:** Reads the executable file from disk and calculates SHA-256 in 64KB chunks (`agent/utils/hash.py`). If access is denied by OS permission checks, the hash falls back gracefully to null.
+- **Lifecycle Diffing:** Maintains previous state keyed by `(pid, process_start_time)`. Emits `process.start` when a new key appears, and `process.exit` with exit timestamp when a key disappears.
 
-## 4.2 Operating system support
-The architecture is designed for:
+## 4.4 OS Authentication Collectors
+Platform collectors gather authentication activity:
+- **Windows (`agent/collectors/windows.py`):** Uses `pywin32` to query the Windows Security Event Log for Event ID 4624 (Logon Success) and 4625 (Logon Failure). Extracts username, domain, logon type, and source IP.
+- **Linux (`agent/collectors/linux.py`):** Scans readable auth logs (`/var/log/auth.log`, `/var/log/secure`) and falls back to `journalctl`. Normalizes SSH, PAM, and sudo log entries into Windows-equivalent 4624/4625 event structures for uniform rule evaluation.
+- **macOS (`agent/collectors/darwin.py`):** Executes bounded `log show` queries targeting loginwindow, sshd, and sudo processes.
 
-- Windows.
-- Linux.
-- macOS.
-Platform-specific collectors are selected based on operating system detection.
-
-Each platform may require different collection mechanisms because operating systems expose system activity through different APIs and filesystem structures.
-
-The common event format allows the backend to process telemetry without depending on the operating system that generated it.
-
-Platform support and collector completeness should be verified individually before claiming production support.
-
-## 4.3 System information collection
-The agent collects basic information about the host.
-
-This provides the backend with context about the device producing telemetry.
-
-System and host information is part of the implemented collection foundation.
-
-The exact inventory fields should be taken from the current collector implementation rather than assumed.
-
-## 4.4 Process monitoring
-Process monitoring is one of the core capabilities of SysMon.
-
-The agent uses Python's `psutil` library for process-related information.
-
-The current process telemetry includes:
-
-FieldDescription`pid`Process ID`ppid`Parent process ID`username`User associated with the process`executable_path`Path to the executable`command_line`Command used to launch the process`process_start_time`Process start timestamp`cpu`CPU usage information`memory`Memory usage information`status`Current process status
-### Process lifecycle tracking
-SysMon maintains information about previously observed processes to identify lifecycle changes.
-
-The agent maintains a previous-process state using `previous_processes`.
-
-By comparing current process observations against previously observed processes, it can identify:
-
-- Newly observed processes.
-- Previously observed processes that are no longer running.
-This allows the agent to track process lifecycle changes instead of reporting only an isolated process snapshot.
-
-### Parent-child process relationships
-Process IDs and parent process IDs provide the foundation for reconstructing process relationships.
-
-For example:
-
-```
-explorer.exe
-    |
-    +---- browser.exe
-    |         |
-    |         +---- browser_helper.exe
-    |
-    +---- terminal.exe
-              |
-              +---- python.exe
-```
-These relationships are useful for security investigation because a suspicious process may be launched by another process.
-
-Full process-tree investigation and visualization remain part of the broader investigation roadmap.
-
-### Process command-line visibility
-Command-line information provides additional context about how a process was launched.
-
-For example, two instances of the same executable may perform very different activities depending on their arguments.
-
-The command line can therefore provide useful investigation context.
-
-### Process hashing
-SHA-256 executable hashing has been included in the process telemetry design.
-
-Hashing provides a way to identify executable files independently of their filenames.
-
-The current implementation coverage should be verified before presenting hashing as a fully operational collector feature.
-
-## 4.5 Authentication monitoring
-Authentication telemetry is part of the current agent collection foundation.
-
-The objective is to capture authentication-related activities from supported operating systems.
-
-Authentication information can help identify:
-
-- Login activity.
-- Failed authentication attempts.
-- Unusual authentication behavior.
-- Potential unauthorized access.
-Different operating systems expose authentication information through different mechanisms.
-
-The exact authentication event types and available fields depend on the platform-specific collectors.
-
-## 4.6 Persistence monitoring
-Persistence monitoring is a planned telemetry capability.
-
-Persistence mechanisms allow applications or attackers to maintain execution across system restarts, user logins, or other lifecycle events.
-
-SysMon's persistence-monitoring design includes inspecting relevant operating-system locations.
-
-### Linux persistence locations
-The current design includes:
-
-- `/etc/crontab`
-- `/etc/cron.*`
-- `/etc/systemd/system/`
-- `~/.bashrc`
-- `~/.ssh/authorized_keys`
-These locations are relevant because they can contain scheduled execution instructions, service definitions, shell initialization commands, or SSH access configuration.
-
-### Windows persistence locations
-The planned Windows collection areas include:
-
-- Registry Run Keys.
-- Scheduled Tasks.
-- Startup folders.
-- Windows services.
-
-### Why persistence monitoring matters
-Unexpected modifications to persistence mechanisms may indicate:
-
-- Unauthorized startup programs.
-- Suspicious scheduled execution.
-- Unauthorized service creation.
-- Attempts to maintain access to a device.
-Persistence monitoring is not yet a capability that should be advertised as fully operational across all platforms.
-
-## 4.7 File integrity monitoring
-File integrity monitoring is another planned telemetry capability.
-
-Its purpose is to detect relevant changes to monitored files and directories.
-
-The design includes monitoring sensitive locations, including temporary directories such as:
-
-- `/tmp`
-- `/var/tmp`
-The broader implementation should support identifying relevant file changes and generating structured telemetry.
-
-Potential file events include:
-
-- File creation.
-- File modification.
-- File deletion.
-- Relevant metadata changes.
-The final monitored paths, hashing strategy, permissions, and event coverage must be defined by the actual collector implementation.
-
-## 4.8 Network activity monitoring
-Network context is part of the planned telemetry expansion.
-
-The objective is to provide additional context about network-related endpoint activity.
-
-Potential investigation information includes:
-
-- Local addresses.
-- Remote addresses.
-- Connection details.
-- Associated processes.
-These are intended capabilities, not a declaration that comprehensive network telemetry is currently implemented.
+## 4.5 Agent Health Collector
+`HealthCollector` records internal sensor diagnostics every cycle:
+- `cpu_percent`: Agent process CPU usage.
+- `memory_rss_mb`: Resident Set Size memory consumed by the agent process.
+- `queue_depth`: Number of pending events in the local SQLite buffer.
+- `dropped_count`: Number of events evicted due to buffer capacity limits.
+- `buffer_bytes`: On-disk size of the SQLite buffer database.
+- `uptime_seconds`: Continuous sensor uptime.
 
 ---
 
 # 5. Event Architecture and Canonical Schema
 
-## 5.1 Why a common schema?
-SysMon is designed to support multiple operating systems.
+## 5.1 EventEnvelope Specification
+Defined in `agent/models/envelope.py` and `backend/models/envelope.py`:
 
-Windows, Linux, and macOS expose system information differently.
-
-If every platform sends completely different event structures, the backend would need separate processing logic for every operating system.
-
-To avoid this, SysMon uses a common event envelope.
-
-This provides a consistent structure for transmitting telemetry.
-
-## 5.2 Event envelope
-The current event envelope includes:
-
-FieldDescription`schema_version`Version of the event schema`tenant_id`Organization associated with the event`host_id`Identity of the monitored host`agent_id`Identity of the reporting agent`event_type`Category of the event`sequence`Event sequence informationThe event also carries event-specific telemetry information.
-
-An example of the current envelope structure:
-
-```
+```json
 {
+  "event_id": "9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d",
   "schema_version": 1,
   "tenant_id": "default",
-  "host_id": "local-windows-host",
-  "agent_id": "registered-agent-id",
+  "host_id": "WORKSTATION-01",
+  "agent_id": "agent_a1b2c3d4e5f6",
   "event_type": "telemetry.snapshot",
-  "sequence": 1
+  "observed_at": "2026-11-06T09:42:00.000000Z",
+  "received_at": "2026-11-06T09:42:00.124500Z",
+  "sequence": 42,
+  "source": "linux_agent",
+  "severity": "informational",
+  "data": {}
 }
 ```
-This is an illustrative example of the current envelope fields, not a complete production event payload.
 
-## 5.3 Schema versioning
-The `schema_version` field allows the event structure to evolve over time.
+## 5.2 Real Payload Examples by Event Type
 
-For example:
-
-- Version 1 may contain basic process information.
-- Version 2 may introduce additional process metadata.
-- Future versions may add new telemetry categories.
-Versioning helps maintain compatibility between agents and backend services.
-
-## 5.4 Event types
-The current event naming includes:
-
-`telemetry.snapshot`
-
-Additional event types should be introduced as collectors and event processing capabilities mature.
-
-The event taxonomy should remain consistent across operating systems.
-
-## 5.5 Event sequencing
-The `sequence` field provides event-ordering information within the agent's event stream.
-
-A production implementation should define its behavior across agent restarts, buffering, retransmission, and token renewal.
-
-## 5.6 Empty telemetry arrays
-An empty process array can be a valid collection result.
-
-For example:
-
-```
+### 1. `telemetry.snapshot` (Host Inventory)
+```json
 {
-  "processes": []
+  "event_type": "telemetry.snapshot",
+  "data": {
+    "system": {
+      "hostname": "PROD-SERVER-01",
+      "cpu_percent": 14.2,
+      "memory_total_mb": 16384,
+      "memory_used_mb": 6240
+    },
+    "network": {
+      "ip_address": "192.168.1.50",
+      "mac_address": "00:1A:2B:3C:4D:5E"
+    },
+    "platform": {
+      "system": "Linux",
+      "release": "6.8.0-48-generic",
+      "version": "#48-Ubuntu SMP",
+      "machine": "x86_64"
+    }
+  }
 }
 ```
-This means the collector returned no process records for that particular collection.
 
-It should not automatically be interpreted as a backend failure.
+### 2. `process.start` (Process Execution)
+```json
+{
+  "event_type": "process.start",
+  "data": {
+    "pid": 4820,
+    "ppid": 2816,
+    "name": "powershell.exe",
+    "executable_path": "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+    "command_line": ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass"],
+    "process_start_time": "2026-11-06T09:41:12.104000Z",
+    "sha256": "7f83b1657ff1fc53b92dc18148a1d65dfc2d4b1fa3d677284addd200126d9069",
+    "username": "CORP\\jdoe",
+    "working_directory": "C:\\Users\\jdoe"
+  }
+}
+```
 
-Collection errors and genuinely empty results should be represented separately.
+### 3. `process.exit` (Process Termination)
+```json
+{
+  "event_type": "process.exit",
+  "data": {
+    "pid": 4820,
+    "process_start_time": "2026-11-06T09:41:12.104000Z",
+    "observed_exit_time": "2026-11-06T09:45:30.000000Z"
+  }
+}
+```
+
+### 4. `security.auth` (Authentication Record)
+```json
+{
+  "event_type": "security.auth",
+  "data": {
+    "timestamp": "2026-11-06T09:40:46.000000Z",
+    "event_id": 4625,
+    "status": "FAILURE",
+    "username": "root",
+    "domain": "PROD-SERVER-01",
+    "logon_type": "SSH (password)",
+    "source_ip": "198.51.100.24"
+  }
+}
+```
+
+### 5. `agent.health` (Sensor Health Metrics)
+```json
+{
+  "event_type": "agent.health",
+  "data": {
+    "cpu_percent": 0.8,
+    "memory_rss_mb": 24.5,
+    "queue_depth": 0,
+    "dropped_count": 0,
+    "buffer_bytes": 65536,
+    "uptime_seconds": 86400.0
+  }
+}
+```
 
 ---
 
 # 6. Agent Enrollment and Authentication
 
-## 6.1 Overview
-SysMon uses a two-stage token architecture for agent registration and ongoing authentication.
+## 6.1 Two-Stage Credential Architecture
+SysMon avoids static API keys:
+1. **Bootstrap Token Generation:** Administrator requests a one-time token (`POST /api/v1/agents/token`). Backend generates a random cryptographic secret, stores its SHA-256 hash in SQLite with a 30-minute expiry, and returns the plaintext token once.
+2. **Enrollment Exchange:** The agent runs `python -m agent.enroll --token <BOOTSTRAP_TOKEN> --backend <URL>`. It sends host metadata (hostname, OS, MAC address, architecture) over HTTPS to `POST /api/v1/agents/enroll`.
+3. **Operational Credential Issuance:** Backend consumes the bootstrap token, creates an `agents` record, assigns a unique `agent_id`, sets `tenant_id="default"`, creates an operational credential valid for 1 hour, and returns the token.
+4. **Atomic Endpoint Persistence:** The agent writes `SIEM_AGENT_ID` and `SIEM_AGENT_TOKEN` into `agent/.env` using an atomic file write (`tempfile` + `os.replace`) with restricted OS permissions (`0600`).
 
-The two token types serve different purposes:
+## 6.2 Token Renewal Loop
+The `AgentTokenManager` background thread:
+- Checks credential expiration every collection cycle.
+- Enters renewal mode when less than 5 minutes remain before token expiration.
+- Sends an authenticated request to `POST /api/v1/agents/renew` over HTTPS.
+- Backend rotates the token hash in SQLite and updates the expiration timestamp, retaining the previous token in a temporary overlap recovery window.
+- Agent atomically persists the replacement token to disk before swapping it in memory.
 
-1. Bootstrap token.
-2. Permanent agent token.
-This separation prevents the initial enrollment credential from becoming the long-term authentication credential.
-
-## 6.2 Bootstrap enrollment
-A bootstrap token is used during the initial registration of an agent.
-
-The enrollment process follows this general flow:
-
-```
-Administrator
-     |
-     v
-Generate Bootstrap Token
-     |
-     v
-Provide Token to Agent
-     |
-     v
-Run Enrollment Process
-     |
-     v
-Agent Sends Token to Backend
-     |
-     v
-Backend Validates Bootstrap Token
-     |
-     v
-Create Agent Registration
-     |
-     v
-Issue Permanent Agent Token
-     |
-     v
-Agent Stores Permanent Token
-```
-The administrator initiates enrollment, and the agent exchanges the bootstrap credential for its own permanent credential.
-
-The enrollment endpoint currently discussed in the project is:
-
-`POST /api/v1/agents/token`
-
-The endpoint is used in the bootstrap-token registration flow.
-
-## 6.3 Permanent agent tokens
-After successful enrollment, the agent receives a permanent agent token.
-
-This token is used for subsequent backend communication.
-
-Each agent should have its own identity and credentials.
-
-The backend can therefore associate telemetry with the registered agent rather than relying only on an untrusted host identifier supplied by the request.
-
-## 6.4 Token renewal
-Long-lived credentials should not remain valid indefinitely.
-
-SysMon includes background token-renewal logic.
-
-The current implementation checks whether a token is approaching expiration.
-
-The renewal logic uses a five-minute renewal threshold.
-
-Conceptually:
-
-```
-if token_expiration <= current_time + five_minutes:
-    renew_token()
-```
-The renewal process is designed to:
-
-1. Check the current token expiration.
-2. Generate a replacement token.
-3. Revoke the previous token.
-4. Update the agent's credential state.
-5. Continue backend communication without requiring manual agent restart.
-The exact renewal API contract and failure-handling guarantees should follow the current implementation.
-
-## 6.5 Token revocation
-Revocation prevents a previously issued credential from continuing to authenticate.
-
-The bootstrap-token design also includes revocation state.
-
-A previously issued or consumed bootstrap credential should not be accepted again once invalidated.
-
-## 6.6 Authentication security principles
-The authentication architecture should follow these principles:
-
-- Separate enrollment credentials from permanent credentials.
-- Assign unique credentials to agents.
-- Validate credentials on protected requests.
-- Support credential expiration.
-- Revoke replaced or compromised credentials.
-- Avoid logging raw authentication tokens.
-- Protect token storage on the endpoint.
-- Use encrypted communication in production.
+## 6.3 Administrator Authentication
+Admin access is secured independently from agent credentials:
+- Passwords are verified and hashed using **Argon2id**.
+- Login sessions (`POST /api/v1/auth/login`) set a 12-hour HttpOnly, SameSite Strict `sysmon_admin_session` cookie.
+- Unsafe HTTP methods (POST, PATCH, DELETE, PUT) require a valid `X-CSRF-Token` header.
+- Initial admin setup (`POST /api/v1/auth/setup`) is restricted to local loopback clients (`127.0.0.1` or `::1`).
 
 ---
 
 # 7. Multi-Tenant Architecture
 
-## 7.1 What is multi-tenancy?
-Multi-tenancy allows one SysMon deployment to serve multiple organizations while maintaining logical separation between their data.
+## 7.1 What is Implemented
+- The `EventEnvelope` model includes a required `tenant_id` field.
+- During enrollment, the backend assigns the agent to `DEFAULT_TENANT_ID` (default: `"default"`).
+- During telemetry ingestion, the gateway derives the agent's registered tenant from SQLite and validates that the request payload matches. Mismatches return HTTP `403 Forbidden`.
 
-For example:
-
-```
-              SysMon Deployment
-                     |
-             Central Backend
-                     |
-           +---------+---------+
-           |                   |
-           v                   v
-      Organization A      Organization B
-           |                   |
-      Agent A1             Agent B1
-      Agent A2             Agent B2
-      Agent A3             Agent B3
-           |                   |
-           v                   v
-      Tenant A Data       Tenant B Data
-```
-Both organizations use the same deployment, but they must not be able to access each other's information.
-
-## 7.2 Why tenant IDs are necessary
-The `tenant_id` field identifies which organization owns a particular event.
-
-Without tenant identification, the backend cannot reliably distinguish between telemetry belonging to different organizations.
-
-For example:
-
-```
-{
-  "tenant_id": "organization-a",
-  "agent_id": "agent-001",
-  "event_type": "telemetry.snapshot"
-}
-```
-This event belongs to Organization A.
-
-Another organization's event would have a different tenant identifier.
-
-## 7.3 Tenant isolation
-Tenant isolation must be enforced throughout the application.
-
-It includes:
-
-- Agent registration.
-- Agent authentication.
-- Telemetry ingestion.
-- Database queries.
-- Alert generation.
-- Dashboard access.
-- Investigation workflows.
-- Administrative operations.
-The backend must not trust a client-provided `tenant_id` without verifying the authenticated agent's registered tenant association.
-
-The authenticated agent identity should determine the authorized tenant context.
-
-## 7.4 SaaS readiness
-Multi-tenancy makes it possible to evolve the platform toward a managed SaaS model in the future.
-
-However, the current product deployment model remains self-hosted/on-premises.
-
-Multi-tenancy is an architectural capability, not proof that a public multi-customer SaaS service is already available.
+## 7.2 What is Not Implemented
+- **No Database Isolation:** ClickHouse tables (`DEVICES`, `EVENTS`, `ALERTS`, `AGENT_HEALTH`) do not include a `tenant_id` column.
+- **No Query Scoping:** Administrator API endpoints (`/api/v1/devices`, `/events`, `/alerts`) execute global queries returning all fleet records.
+- **No Tenant Management:** There are no tenant creation, billing, or organization administration APIs.
+- **Conclusion:** SysMon must not be described as supporting production multi-tenancy. It functions as a single-organization platform.
 
 ---
 
 # 8. Offline Agent Behavior and Reliability
 
-## 8.1 Why offline support matters
-Endpoint devices may temporarily lose connectivity because of:
+## 8.1 SQLite Write-Ahead Logging (WAL) Buffer
+When the backend is unreachable, telemetry accumulates in `agent/.agent_buffer.db`:
+- **Mode:** WAL allows continuous collection while transport threads read pending batches.
+- **Durability:** `synchronous=FULL` ensures transactions are committed to disk before returning.
+- **Event Uniqueness:** An `event_id UNIQUE` constraint prevents duplicate queue insertion.
 
-- Network outages.
-- Server maintenance.
-- Firewall restrictions.
-- VPN disconnections.
-- Temporary backend unavailability.
-The agent should not immediately discard collected telemetry whenever communication fails.
+## 8.2 Bounded Capacity & Eviction Semantics
+- **Capacities:** Configured via `SIEM_BUFFER_MAX_EVENTS` (default 25,000) and `SIEM_BUFFER_MAX_BYTES` (default 50 MiB).
+- **Eviction:** When limits are reached, the buffer deletes the oldest events first (FIFO). An internal counter `dropped_count` is incremented and transmitted in subsequent health snapshots.
+- **Retention:** Events older than `SIEM_BUFFER_RETENTION_SECONDS` (default 7 days) are purged during periodic maintenance.
 
-## 8.2 Collect-and-buffer strategy
-The selected offline behavior is to continue collecting telemetry and buffer it locally.
-
-The intended flow is:
-
-```
-Telemetry Collection
-        |
-        v
-   Send to Backend
-        |
-        v
-  Is Backend Available?
-       / \
-     Yes  No
-      |    |
-      v    v
-   Accept  Buffer Locally
-      |    |
-      v    v
-   Acknowledge
-           |
-           v
-     Retry Later
-           |
-           v
-     Send Buffered Data
-           |
-           v
-       Acknowledge
-```
-
-## 8.3 Bounded buffering
-The agent uses bounded buffering rather than allowing unlimited local accumulation.
-
-This prevents offline collection from consuming unlimited disk or memory resources.
-
-## 8.4 Retry mechanism
-When communication fails, the agent retries transmission.
-
-Retry handling should avoid unnecessary repeated requests and should recover when the backend becomes available again.
-
-## 8.5 Acknowledgements
-The agent-side reliability implementation includes acknowledgement handling.
-
-Acknowledgements are important because they allow the agent to distinguish accepted events from events that still require retransmission.
-
-The complete production delivery guarantees, including duplicate handling and persistence across machine restarts, must be validated against the current implementation.
-
-## 8.6 Delivery considerations
-A reliable production system should address:
-
-- Duplicate events.
-- Out-of-order delivery.
-- Sequence continuity.
-- Buffer limits.
-- Retry limits.
-- Disk exhaustion.
-- Corrupted buffered data.
-- Server acknowledgement behavior.
-These are reliability requirements, not claims that every edge case is already fully handled.
+## 8.3 Retries & Backoff
+`ship_to_backend()` employs exponential backoff:
+- Base delay doubles after each consecutive network failure, capped at 300 seconds.
+- Randomized jitter is applied to prevent thundering herd spikes when backend services recover.
+- If the server responds with HTTP `429 Too Many Requests`, the agent parses the `Retry-After` header and sleeps for the requested duration.
+- Events are deleted from the local buffer only after the gateway returns HTTP `202 Accepted` with exact matching accepted event IDs.
 
 ---
 
 # 9. Detection Engine
 
-## 9.1 Overview
-The SysMon detection engine evaluates collected telemetry against centrally maintained detection rules.
+## 9.1 Architecture
+The detection engine (`worker/detection/engine.py`) loads YAML rules at worker startup and evaluates incoming `security.auth` event batches. Supported condition strategies:
+1. **Threshold Condition:** Tracks event counts for a specific field value within a sliding time window in memory.
+2. **Pattern Match Condition:** Evaluates field values against case-insensitive string lists.
+3. **Time Window Condition:** Checks if event timestamps fall within configured UTC hour ranges.
 
-The detection engine is part of the backend processing layer.
+## 9.2 Complete 7 YAML Rules Catalog
 
-It is not intended to run the complete detection rule system inside every endpoint agent.
+| Rule File | Strategy | Configured Intent | Severity | Implementation Caveat |
+| :--- | :--- | :--- | :--- | :--- |
+| `brute_force.yaml` | Threshold | ≥5 failed logins from same IP in 60s | CRITICAL | Works as designed; stateful sliding window in memory. |
+| `after_hours_login.yaml` | Time Window | Successful login between 22:00–06:00 UTC | HIGH | Works as designed for UTC timestamps. |
+| `privileged_account_login.yaml` | Pattern Match | Logins matching root, administrator, admin | HIGH | Does not check status=SUCCESS; failed attempts also trigger alert. |
+| `multiple_ip_login.yaml` | Threshold | Logins from multiple IPs in 5 minutes | CRITICAL | Counts username occurrences; does not count distinct IPs. |
+| `new_device_seen.yaml` | Threshold | Discovery of new agents | MEDIUM | Evaluates events grouped per agent; agent_id is constant in group. |
+| `off_hours_service_start.yaml` | Time Window | Service logons between 20:00–07:00 UTC | MEDIUM | Checks time and status; omits filter on logon_type="Service". |
+| `repeated_logon_type_change.yaml` | Threshold | Alternating logon types in 180s | HIGH | Threshold counts username, not logon_type variation. |
 
-## 9.2 Server-side detection
-The selected architecture keeps detection rules on the backend.
-
-The endpoint agent collects and reports information.
-
-The worker evaluates that information.
-
-This separation provides several advantages:
-
-- Centralized rule management.
-- Consistent detection behavior.
-- Easier rule updates.
-- Less detection logic on endpoints.
-- Reduced need to redeploy agents for every rule change.
-
-## 9.3 YAML-based rules
-SysMon uses YAML-based detection rules.
-
-YAML provides a human-readable format for defining detection conditions and associated metadata.
-
-The rule implementation should document the actual supported fields, operators, matching semantics, and severity values from the worker code.
-
-## 9.4 Detection workflow
-
-```
-Telemetry Event
-      |
-      v
-Kafka Consumer
-      |
-      v
-Event Processing
-      |
-      v
-Detection Engine
-      |
-      v
-Evaluate YAML Rules
-      |
-      v
-Conditions Satisfied?
-      |
-   +--+--+
-   |     |
-  No    Yes
-   |     |
-   v     v
-Ignore  Generate Finding
-         |
-         v
-    Persist Alert
-         |
-         v
-    Notify Analysts
-```
-
-## 9.5 Detection hardening
-The broader detection roadmap includes improving:
-
-- Rule versioning.
-- Idempotency.
-- Alert deduplication.
-- Event correlation.
-- Detection reliability.
-- Rule execution consistency.
-These capabilities help prevent repeated or inconsistent findings.
-
-## 9.6 Important limitation
-SysMon should not currently be described as providing a complete antivirus engine, malware sandbox, behavioral AI detection system, or comprehensive threat intelligence platform.
-
-Its current direction is structured endpoint telemetry combined with centrally evaluated detection rules.
+## 9.3 In-Memory State Limitations
+Threshold counters are stored in Python `deque` structures in process memory. If the worker process restarts, active sliding window history is lost. Rule modifications require a worker restart.
 
 ---
 
 # 10. Alert Management
 
-## 10.1 Overview
-Alerts represent findings generated by the detection engine.
+## 10.1 FiredAlert Model
+When a detection rule matches, a `FiredAlert` is generated:
+- `id`: Unique UUID string.
+- `rule_name`: Identifier of the triggering rule.
+- `severity`: Informational, Low, Medium, High, Critical.
+- `agent_id`: Monitored endpoint ID.
+- `triggered_at`: UTC timestamp when the rule evaluated true.
+- `message`: Formatted human-readable alert description.
+- `context`: JSON-serialized string containing offending event details.
+- `resolved`: Integer flag (`0` = Open, `1` = Resolved).
 
-They provide analysts with a centralized place to review potentially suspicious activity.
+## 10.2 Persistence & Triage
+- Written to the ClickHouse `ALERTS` table via bulk insert.
+- Queried by the dashboard via `GET /api/v1/alerts`.
+- Resolved via `PATCH /api/v1/alerts/{alert_id}/resolve` with body `{"resolved": true}` and CSRF validation.
 
-## 10.2 Alert persistence
-The current project includes alert persistence functionality.
-
-This allows findings to remain available rather than existing only temporarily during rule evaluation.
-
-## 10.3 Alert management
-The existing dashboard includes alert views and alert-management functionality.
-
-Alert toggling is part of the implemented functionality.
-
-The exact meaning of each alert state, including whether an alert is open, resolved, acknowledged, or suppressed, must be taken from the current application implementation.
-
-## 10.4 Notifications
-The project includes notification functionality.
-
-The broader notification design includes delivery through channels such as:
-
-- Slack.
-- Discord.
-- WhatsApp.
-- Email.
-The availability and configuration of each channel should be documented according to its actual implementation.
-
-## 10.5 Future alert improvements
-The roadmap includes improving:
-
-- Deduplication.
-- Correlation.
-- Durable alert state.
-- Alert investigation context.
-- Notification reliability.
-- Analyst workflows.
+## 10.3 Outbound Notification Adapters
+Implemented in `worker/alerting/`:
+- **Slack Adapter (`slack.py`):** Formats alert severity, host, and message into Slack Block Kit payloads and posts to `SLACK_WEBHOOK_URL`.
+- **Discord Adapter (`discord.py`):** Posts formatted embeds with severity color bars to `DISCORD_WEBHOOK_URL`.
+- **Email Adapter (`email.py`):** Sends MIME email over standard SMTP (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`).
 
 ---
 
 # 11. SysMon Dashboard
 
-## 11.1 Overview
-The SysMon dashboard provides a centralized interface for viewing endpoint information and security telemetry.
-
-It is intended to help administrators and security analysts understand the status of their monitored infrastructure.
-
-## 11.2 Device view
-The current dashboard includes device-related views.
-
-These provide visibility into registered or monitored endpoints.
-
-The dashboard is intended to make it easier to understand the state of the endpoint fleet.
-
-## 11.3 Event view
-The dashboard includes event-related views.
-
-These provide access to collected endpoint telemetry.
-
-The longer-term objective is to support filtering and investigation across different event categories and time ranges.
-
-## 11.4 Alert view
-The dashboard includes alert-related views.
-
-Analysts can review generated findings and use the existing alert-management functionality.
-
-## 11.5 Future dashboard capabilities
-The investigation roadmap includes:
-
-- Endpoint timelines.
-- Process-tree visualization.
-- Persistence investigation.
-- Improved event search.
-- Alert-to-event relationships.
-- Investigation cases.
-- More comprehensive filtering.
-These should be treated as future enhancements unless verified in the current dashboard.
+The dashboard is a React 19 single-page application built with Vite:
+- **Security Overview:** Polls aggregate stats every 15 seconds from `GET /api/v1/devices/stats` and `GET /api/v1/alerts/stats`.
+- **Device Explorer:** Displays active hosts from `GET /api/v1/devices` with OS details and latest check-in times.
+- **Event Explorer:** Searchable table of authentication records via `GET /api/v1/events`.
+- **Threats View:** Triage queue for fired alerts with resolution toggle (`PATCH /resolve`).
+- **Rules View:** Lists YAML detection rules and allows runtime toggling via `POST /api/v1/rules/{name}/toggle` (note: overrides are in-memory).
 
 ---
 
 # 12. Security Architecture
 
-## 12.1 Security objectives
-SysMon is itself a security product. Its own architecture must therefore be designed to protect collected telemetry, endpoint credentials, and organizational information.
-
-The main security objectives are:
-
-- Authentication.
-- Authorization.
-- Tenant isolation.
-- Secure communication.
-- Credential protection.
-- Controlled access to telemetry.
-- Reliable auditability.
-
-## 12.2 Agent authentication
-Agents authenticate using their assigned credentials.
-
-Bootstrap credentials are used for enrollment, while permanent credentials are used for regular communication.
-
-Credentials should be validated by the backend before accepting protected operations.
-
-## 12.3 TLS communication
-TLS is part of the planned production security architecture.
-
-Caddy has been considered as the TLS termination and reverse-proxy component.
-
-The intended communication path is:
-
-```
-Endpoint Agent
-      |
-      | HTTPS
-      v
-     Caddy
-      |
-      | Internal proxy
-      v
- FastAPI Gateway
-```
-Caddy can manage HTTPS certificates and forward requests to the internal application.
-
-TLS should be configured before exposing the deployment to untrusted networks.
-
-Do not advertise production TLS protection until the configuration has been implemented and verified.
-
-## 12.4 Rate limiting and backpressure
-Rate limiting and backpressure are important for protecting the ingestion pipeline.
-
-Valkey has been considered for managing rate-limiting state and controlling traffic pressure.
-
-The goal is to prevent excessive incoming traffic from overwhelming backend services.
-
-## 12.5 Data isolation
-Every authenticated request must be associated with an authorized tenant.
-
-A tenant must not be able to retrieve another tenant's devices, events, or alerts.
-
-## 12.6 Administrative access
-Administrative functionality must be protected separately from ordinary agent communication.
-
-Administrative operations should not be exposed simply because a caller possesses an agent token.
-
-## 12.7 Security roadmap
-Further security work includes:
-
-- TLS verification.
-- Collector failure reporting.
-- Authorization hardening.
-- Deployment security assessment.
-- Pilot testing.
-- Credential and data-handling review.
+- **Transport Encryption:** Enforced HTTPS in production; plain HTTP returns HTTP `426 Upgrade Required`.
+- **Credential Storage:** All passwords hashed with **Argon2id**; agent tokens stored as **SHA-256** hashes.
+- **Session Security:** 12-hour session cookies with `HttpOnly`, `SameSite=Strict`, and `Secure` attributes.
+- **CSRF Protection:** State-changing requests require a rotating `X-CSRF-Token` header.
+- **Rate Limiting:** Telemetry ingestion limited to 10 requests / 10s per agent; login limited to 5 requests / 60s per IP (Valkey backend with process-local fallback).
+- **Privacy Notice:** Command-line arguments and usernames are currently collected without redaction; do not pass sensitive passwords on command lines on monitored endpoints.
 
 ---
 
 # 13. Deployment Architecture
 
-## 13.1 Deployment model
-SysMon is designed as a self-hosted/on-premises product.
-
-The organization deploying SysMon owns its infrastructure and collected data.
-
-A mandatory external cloud service is not part of the selected deployment model.
-
-## 13.2 Containerization
-Dockerfiles and Docker Compose infrastructure have been added to the project.
-
-Containerization is intended to simplify the deployment of backend services and their dependencies.
-
-## 13.3 Deployment components
-The broader deployment architecture includes:
-
-- FastAPI gateway.
-- Kafka.
-- Processing workers.
-- ClickHouse.
-- Product-state storage.
-- Redis-compatible operational storage where required.
-- Dashboard frontend.
-- Caddy for production TLS termination.
-The exact service list and dependency configuration should be verified against the current Docker Compose files.
-
-## 13.4 Administrator responsibilities
-A self-hosted installation requires administrators to manage:
-
-- Server infrastructure.
-- Network access.
-- Storage capacity.
-- Service availability.
-- Credentials.
-- Backups.
-- Software upgrades.
-- Data retention.
-
-## 13.5 Future deployment improvements
-The deployment roadmap includes:
-
-- Complete installation documentation.
-- Production configuration.
-- Backup and restore procedures.
-- Upgrade and migration procedures.
-- Retention configuration.
-- Monitoring and operational health checks.
+SysMon is currently deployed using separate service components:
+1. **Kafka KRaft Cluster:** `infra/kafka/docker-compose.yaml` (3 brokers, host ports 29092/39092/49092).
+2. **ClickHouse Server:** `infra/clickhouse/docker-compose.yaml` (HTTP 8123, native 9000).
+3. **Valkey Service:** `infra/redis/docker-compose.yaml` (port 6379).
+4. **Backend Gateway:** `python -m backend` (Uvicorn on port 8000).
+5. **Processing Worker:** `python -m worker.main` (Kafka consumer).
+6. **Dashboard Frontend:** Multi-stage Node/Nginx container or `npm run dev`.
 
 ---
 
 # 14. Technology Stack
-The following technologies are part of the current or intended SysMon architecture.
 
-| Technology | Responsibility |
-| --- | --- |
-| Python | Agent and backend development |
-| FastAPI | Backend API and ingestion gateway |
-| psutil | Process and system telemetry collection |
-| Apache Kafka | Event transport and asynchronous processing |
-| ClickHouse | High-volume telemetry storage and analytics |
-| PostgreSQL | Structured application-state storage |
-| SQLite | Earlier administrative storage decision |
-| Redis / Valkey | Token-related and operational state |
-| YAML | Detection rule definitions |
-| Docker | Containerization |
-| Docker Compose | Multi-service deployment |
-| Caddy | Planned TLS termination and reverse proxy |
-
-Not every technology listed above is necessarily active in every deployment configuration.
+| Technology | Role in SysMon | Implementation Status |
+| :--- | :--- | :--- |
+| **Python 3** | Sensor, FastAPI backend, and processing worker | Implemented; 118 tests pass |
+| **FastAPI** | REST API gateway registering 30 operations | Implemented |
+| **Pydantic v2** | Data modeling and schema validation | Implemented |
+| **Apache Kafka** | Distributed message streaming (KRaft mode) | Implemented in Compose & code |
+| **ClickHouse** | Columnar MergeTree database for telemetry | Implemented in Compose & code |
+| **SQLite** | Local buffer queue & backend auth/credential DB | Implemented |
+| **Valkey / Redis** | Rate limiting backend with memory fallback | Implemented in Compose & code |
+| **React 19 / Vite** | Web administration dashboard | Implemented |
+| **Argon2id** | Administrator password hashing | Implemented |
+| **psutil / pywin32** | Host metrics, process inspection, Windows logs | Implemented |
+| **PostgreSQL** | Not present in codebase | Planned future work |
+| **Caddy** | Not present in codebase | Planned future work |
 
 ---
 
-# 15. API and Communication
+# 15. Complete API Reference (30 Active Operations)
 
-## 15.1 API architecture
-The backend exposes API functionality through FastAPI.
+The FastAPI application mounts 8 routers registering **30 HTTP operations**. All 30 appear in the OpenAPI specification; 27 have direct unit/API test coverage.
 
-The API is responsible for communication between the endpoint agents and the backend.
+### Summary Inventory Table
 
-The current documented enrollment endpoint is:
+| Method | Endpoint Path | Authentication | Purpose | Test Status |
+| :--- | :--- | :--- | :--- | :--- |
+| `GET` | `/` | None | API root metadata & version | Tested |
+| `GET` | `/health` | None | Service dependency health check | Tested |
+| `GET` | `/api/v1/auth/status` | None | Initial admin setup status check | Tested |
+| `POST` | `/api/v1/auth/setup` | Loopback IP Only | One-time initial admin user creation | Tested |
+| `POST` | `/api/v1/auth/login` | None (Rate-limited) | Admin login; returns session cookie & CSRF | Tested |
+| `GET` | `/api/v1/auth/me` | Admin Session | Current admin identity & rotated CSRF | Tested |
+| `POST` | `/api/v1/auth/logout` | Admin Session + CSRF | Revoke session and clear cookies | Tested |
+| `POST` | `/api/v1/auth/password` | Admin Session + CSRF | Change admin password; revokes sessions | Tested |
+| `POST` | `/api/v1/telemetry` | Agent Bearer Token | Ingest telemetry envelopes into Kafka | Tested |
+| `GET` | `/api/v1/alerts` | Admin Session | Filtered list of fired detection alerts | Tested |
+| `GET` | `/api/v1/alerts/stats` | Admin Session | Aggregate alert severity statistics | Tested |
+| `GET` | `/api/v1/alerts/{alert_id}` | Admin Session | Detailed forensic context for single alert | Tested |
+| `PATCH` | `/api/v1/alerts/{alert_id}/resolve` | Admin Session + CSRF | Mark alert as resolved or reopen | Tested |
+| `GET` | `/api/v1/devices` | Admin Session | List enrolled device inventory | Tested |
+| `GET` | `/api/v1/devices/stats` | Admin Session | Aggregate device online/offline counts | Tested |
+| `GET` | `/api/v1/devices/{agent_id}` | Admin Session | Single device metadata and health | Tested |
+| `GET` | `/api/v1/devices/{agent_id}/health` | Admin Session | Latest sensor health telemetry | Tested |
+| `GET` | `/api/v1/devices/{agent_id}/history` | Admin Session | Historical device check-in snapshots | Tested |
+| `GET` | `/api/v1/events` | Admin Session | Search normalized authentication events | Tested |
+| `GET` | `/api/v1/events/stats` | Admin Session | Aggregate authentication statistics | Tested |
+| `GET` | `/api/v1/rules` | Admin Session | List all YAML detection rules & states | Tested |
+| `GET` | `/api/v1/rules/{name}` | Admin Session | Detailed rule condition & raw YAML | Mounted |
+| `POST` | `/api/v1/rules/{name}/toggle` | Admin Session + CSRF | Enable or disable a detection rule | Tested |
+| `PUT` | `/api/v1/rules/{name}/toggle` | Admin Session + CSRF | Alias for POST rule toggle | Mounted |
+| `GET` | `/api/v1/agents` | Admin Session | Agent inventory via ClickHouse devices | Mounted |
+| `GET` | `/api/v1/agents/tokens` | Admin Session | List active agent credentials metadata | Tested |
+| `POST` | `/api/v1/agents/token` | Admin Session + CSRF | Generate one-time 30-min bootstrap token | Tested |
+| `POST` | `/api/v1/agents/enroll` | Bootstrap Token | Enroll agent; returns 1h operational token | Tested |
+| `POST` | `/api/v1/agents/renew` | Agent Bearer Token | Rotate operational agent credential | Tested |
+| `DELETE` | `/api/v1/agents/tokens/{id}` | Admin Session + CSRF | Revoke agent token and deactivate agent | Tested |
 
-**POST **`/api/v1/agents/token`
+---
 
-Purpose:
+## 15.1 Root & System Health
 
-Exchange a valid bootstrap credential for an agent-specific permanent credential during enrollment.
+### `GET /`
+- **Purpose:** Root service metadata.
+- **Authentication:** None.
+- **Response (200 OK):**
+```json
+{
+  "name": "SysMon API Gateway",
+  "version": "0.1.0",
+  "status": "active",
+  "docs": "/docs"
+}
+```
 
-The complete API contract should be maintained alongside the implemented route definitions.
+### `GET /health`
+- **Purpose:** Dependency readiness and health check.
+- **Authentication:** None.
+- **Response (200 OK):**
+```json
+{
+  "status": "healthy",
+  "uptime_seconds": 86420.5,
+  "services": {
+    "kafka": "connected",
+    "clickhouse": "connected",
+    "redis": "connected"
+  }
+}
+```
+*Note: Kafka reports connected if the producer instance is active; ClickHouse runs a live ping. Redis connection failure causes memory fallback and is reported as `fallback`.*
 
-## 15.2 API documentation requirements
-The finished API reference should document:
+---
 
-- Endpoint paths.
-- HTTP methods.
-- Authentication requirements.
-- Request bodies.
-- Response bodies.
-- Validation rules.
-- Error responses.
-- Rate limits.
-- Versioning.
-- Tenant authorization behavior.
-Additional route paths and payloads should be extracted from the actual FastAPI application rather than invented in this documentation.
+## 15.2 Administrator Authentication Router (`/api/v1/auth`)
+
+### `GET /api/v1/auth/status`
+- **Purpose:** Checks whether initial administrator setup is required.
+- **Authentication:** None.
+- **Response (200 OK):** `{"setup_required": false}`
+
+### `POST /api/v1/auth/setup`
+- **Purpose:** One-time initial administrator user creation.
+- **Authentication:** Restricted to direct loopback client (`127.0.0.1` or `::1`); rejects forwarded proxy headers.
+- **Request Body (`CredentialsRequest`):**
+```json
+{
+  "username": "admin",
+  "password": "Example!SecurePassword2026"
+}
+```
+- **Password Policy:** 12–128 characters; rejects simplistic/common patterns; hashed with Argon2id.
+- **Response (201 Created):** User metadata and sets HttpOnly, SameSite=Strict `sysmon_admin_session` cookie; returns rotating `csrf_token`.
+
+### `POST /api/v1/auth/login`
+- **Purpose:** Authenticate administrator and establish session.
+- **Authentication:** None. Rate limited to 5 attempts per 60 seconds per IP.
+- **Request Body:** Same `CredentialsRequest` schema.
+- **Response (200 OK):** User metadata, returns `csrf_token`, and sets secure session cookie.
+
+### `GET /api/v1/auth/me`
+- **Purpose:** Retrieves current administrator identity and a freshly rotated CSRF token.
+- **Authentication:** `sysmon_admin_session` cookie required.
+- **Response (200 OK):** `{"id": "...", "username": "admin", "role": "admin", "csrf_token": "..."}`
+
+### `POST /api/v1/auth/logout`
+- **Purpose:** Revokes active session in SQLite and clears the session cookie.
+- **Authentication:** Admin session cookie + `X-CSRF-Token` header.
+- **Response (200 OK):** `{"status": "logged_out"}`
+
+### `POST /api/v1/auth/password`
+- **Purpose:** Changes administrator password and invalidates all existing sessions.
+- **Authentication:** Admin session cookie + `X-CSRF-Token` header.
+- **Request Body:** `{"new_password": "New!SecurePassword2026"}`
+- **Response (200 OK):** `{"status": "password_changed"}`
+
+---
+
+## 15.3 Telemetry Ingestion Router (`/api/v1/telemetry`)
+
+### `POST /api/v1/telemetry`
+- **Purpose:** High-throughput ingestion of agent telemetry envelopes.
+- **Authentication:** Bearer token in `Authorization` header (`Bearer <OPERATIONAL_TOKEN>`) or `X-Agent-Token` header.
+- **Transport Requirement:** Enforced HTTPS in production (plain HTTP returns `426 Upgrade Required`).
+- **Rate Limit:** 10 requests per 10 seconds per agent.
+- **Request Body:** Accepts a single `EventEnvelope`, an array of envelopes, or `{"events": [...]}`.
+- **Validation Rules:**
+  - `event_id` must be a valid UUID string.
+  - Required fields: `host_id`, `agent_id`, `event_type`, `observed_at`, `source`.
+  - Batch duplicate `event_id` values are rejected (`400 Bad Request`).
+  - Envelope `agent_id` and `tenant_id` must match the authenticated token derived from SQLite.
+- **Processing:**
+  - Stamps `received_at` timestamp.
+  - Deduplicates incoming event IDs against SQLite `telemetry_receipts`.
+  - Publishes new events to Kafka topic `telemetry_data` with `acks="all"`.
+  - Records receipts in SQLite.
+- **Response (202 Accepted):**
+```json
+{
+  "status": "accepted",
+  "ingested_count": 1,
+  "accepted_event_ids": ["9b1deb4d-3b7d-4bad-9bdd-2b0d7b3dcb6d"],
+  "received_at": "2026-11-06T09:42:00.124500Z"
+}
+```
+
+---
+
+## 15.4 Alerts Router (`/api/v1/alerts`)
+
+All alert routes require an active administrator session.
+
+### `GET /api/v1/alerts`
+- **Query Parameters:** `limit` (default 50, max 500), `offset` (default 0), optional `severity`, `agent_id`, `rule_name`, `resolved` (0 or 1), `start_time`, `end_time`.
+- **Response (200 OK):** ClickHouse analytical query result `{items: [...], total: N, limit: 50, offset: 0}`.
+
+### `GET /api/v1/alerts/stats`
+- **Purpose:** Aggregate statistics on total, critical, high, medium, and low alerts.
+- **Response (200 OK):** `{total_alerts: 12, critical: 3, high: 5, medium: 4, low: 0, unresolved: 8}`
+
+### `GET /api/v1/alerts/{alert_id}`
+- **Purpose:** Retrieve complete forensic context for a single alert.
+- **Response (200 OK):** Alert record with JSON context string containing offending event details. Returns 404 if not found.
+
+### `PATCH /api/v1/alerts/{alert_id}/resolve`
+- **Purpose:** Mark an alert as resolved (`1`) or reopen (`0`).
+- **Authentication:** Admin session cookie + `X-CSRF-Token` header.
+- **Request Body:** `{"resolved": true}`
+- **Response (200 OK):** `{"status": "success", "alert_id": "...", "resolved": true}`
+
+---
+
+## 15.5 Devices Router (`/api/v1/devices`)
+
+All device routes require an active administrator session.
+
+### `GET /api/v1/devices`
+- **Purpose:** Fleet inventory list queried from ClickHouse `DEVICES` table.
+- **Response (200 OK):** `{items: [...], total: N}`
+
+### `GET /api/v1/devices/stats`
+- **Purpose:** Fleet counts: total endpoints, online (seen in last 5 minutes), offline.
+- **Response (200 OK):** `{total_devices: 128, online_devices: 124, offline_devices: 4}`
+
+### `GET /api/v1/devices/{agent_id}`
+- **Purpose:** Detailed hardware, operating system, and latest health metrics for an endpoint.
+- **Response (200 OK):** Device record merged with latest `AGENT_HEALTH` readings.
+
+### `GET /api/v1/devices/{agent_id}/health`
+- **Purpose:** Query current sensor health diagnostics (CPU %, RSS memory, queue depth, dropped count).
+- **Response (200 OK):** Health metrics record or `{"status": "no_health_data"}`.
+
+### `GET /api/v1/devices/{agent_id}/history`
+- **Query Parameters:** `limit` (1–500, default 50).
+- **Response (200 OK):** Historical check-in time-series snapshots for the host.
+
+---
+
+## 15.6 Authentication Events Router (`/api/v1/events`)
+
+### `GET /api/v1/events`
+- **Query Parameters:** `limit` (default 50), `offset`, `agent_id`, `username`, `source_ip`, `status` (SUCCESS/FAILURE), `logon_type`, `start_time`, `end_time`.
+- **Response (200 OK):** `{items: [...], total: N}` from ClickHouse `EVENTS` table.
+
+### `GET /api/v1/events/stats`
+- **Purpose:** Aggregated login activity: total attempts, successful vs failed counts, top targeted usernames.
+- **Response (200 OK):** Summary metrics dictionary.
+
+---
+
+## 15.7 Detection Rules Router (`/api/v1/rules`)
+
+### `GET /api/v1/rules`
+- **Purpose:** List all 7 YAML detection rules loaded in worker directory with current runtime enabled/disabled state.
+- **Response (200 OK):** `{items: [...], total: 7}`
+
+### `GET /api/v1/rules/{name}`
+- **Purpose:** Detailed view of rule condition, description, severity, and raw YAML content.
+- **Response (200 OK):** Complete rule object or 404.
+
+### `POST /api/v1/rules/{name}/toggle` and `PUT /api/v1/rules/{name}/toggle`
+- **Purpose:** Runtime enable/disable toggle.
+- **Authentication:** Admin session cookie + `X-CSRF-Token` header.
+- **Request Body:** `{"enabled": true}` (or null to toggle).
+- **Response (200 OK):** `{"status": "success", "name": "brute_force", "enabled": true}`
+*Note: Overrides are maintained in process memory.*
+
+---
+
+## 15.8 Agent Management Router (`/api/v1/agents`)
+
+### `GET /api/v1/agents`
+- **Purpose:** Agent list via ClickHouse device inventory.
+- **Response (200 OK):** `{items: [...], total: N}`
+
+### `GET /api/v1/agents/tokens`
+- **Purpose:** List credential metadata for all issued agent tokens (omits secret hashes).
+- **Response (200 OK):** `{items: [...], total: N}`
+
+### `POST /api/v1/agents/token`
+- **Purpose:** Generate a one-time 30-minute bootstrap enrollment token.
+- **Authentication:** Admin session cookie + `X-CSRF-Token` header.
+- **Request Body:** `{"description": "Enrollment for node-01"}`
+- **Response (201 Created):** Metadata and `bootstrap_token` string (no-store).
+
+### `POST /api/v1/agents/enroll`
+- **Purpose:** Complete agent enrollment handshake.
+- **Authentication:** Bootstrap token provided in JSON body. Enforced HTTPS.
+- **Request Body:**
+```json
+{
+  "bootstrap_token": "<30_MIN_BOOTSTRAP_TOKEN>",
+  "hostname": "WORKSTATION-01",
+  "operating_system": "Linux",
+  "mac_address": "00:1A:2B:3C:4D:5E",
+  "machine_architecture": "x86_64"
+}
+```
+- **Response (200 OK):**
+```json
+{
+  "agent_id": "agent_a1b2c3d4e5f6",
+  "tenant_id": "default",
+  "token": "<1_HOUR_OPERATIONAL_BEARER_TOKEN>",
+  "expires_at": "2026-11-06T10:42:00.000000Z"
+}
+```
+
+### `POST /api/v1/agents/renew`
+- **Purpose:** Rotate an operational agent credential.
+- **Authentication:** Bearer token in Authorization header. Enforced HTTPS.
+- **Response (200 OK):**
+```json
+{
+  "renewed": true,
+  "agent_id": "agent_a1b2c3d4e5f6",
+  "token": "<NEW_1_HOUR_OPERATIONAL_BEARER_TOKEN>",
+  "expires_at": "2026-11-06T11:42:00.000000Z"
+}
+```
+
+### `DELETE /api/v1/agents/tokens/{credential_id}`
+- **Purpose:** Revoke an agent credential and mark the agent as inactive.
+- **Authentication:** Admin session cookie + `X-CSRF-Token` header.
+- **Response (200 OK):** `{"status": "success", "message": "Token revoked"}`
 
 ---
 
 # 16. Operational Reliability
 
-## 16.1 Agent health
-The project includes agent health functionality.
-
-The purpose is to provide visibility into whether registered agents are communicating and operating.
-
-## 16.2 Service management
-Agent service management is part of the implemented foundation.
-
-The intended experience is that an installed agent runs as a background service without requiring manual startup by the end user.
-
-## 16.3 Collector failure reporting
-Collector-failure reporting remains an area of planned improvement.
-
-A collector failing to retrieve telemetry should be distinguishable from a collector successfully returning no records.
-
-## 16.4 Backend health
-The backend should expose operational health information so administrators can identify failures in ingestion, processing, storage, and dependent services.
-
-The complete production monitoring and health-check strategy remains part of deployment hardening.
+- **Health Check Semantics:** `GET /health` returns HTTP 200 with JSON payload containing status for Kafka, ClickHouse, and Valkey. Note: Kafka status checks producer object existence; Valkey connection failure falls back to memory and does not fail the overall check.
+- **Port Alignment:** The worker defaults to ClickHouse port `8443` while Docker Compose exposes `8123`. Operators must set `CLICKHOUSE_PORT=8123` in the worker environment.
+- **Process Memory Limits:** Ingestion rate limiters and threshold rule engines operate in memory. Worker restarts clear active threshold counts.
 
 ---
 
 # 17. Privacy and Data Handling
-SysMon collects information from endpoint devices.
 
-Some telemetry may contain sensitive operational information, including usernames, executable paths, command-line arguments, and authentication-related records.
-
-Therefore, deployments should:
-
-- Collect only the telemetry required for the intended security purpose.
-- Restrict access to collected data.
-- Protect stored credentials.
-- Encrypt communication.
-- Define data-retention policies.
-- Protect backups.
-- Avoid exposing sensitive command-line information unnecessarily.
-- Provide appropriate access controls to analysts.
-- Keep tenant data logically isolated.
-Organizations deploying SysMon are responsible for ensuring their collection and retention practices comply with applicable legal and organizational requirements.
+- **Command-Line Exposure:** Process command-line arguments are collected verbatim. If users execute scripts with inline credentials, these will appear in process telemetry.
+- **Username Privacy:** Real local and domain usernames are collected and stored.
+- **Data Retention:** Endpoint SQLite buffers enforce 7-day retention. ClickHouse tables currently do not have TTL expiration policies defined; operators must manage analytical retention manually.
 
 ---
 
 # 18. Current Development Status
-SysMon is under active development.
 
-The following values are a historical planning snapshot supplied for this documentation portal. They are not live repository-derived measurements, measurements of engineering effort, or evidence of production readiness.
-
-| Phase | Area | Historical estimate |
-| --- | --- | ---: |
-| Phase 0 | Foundation | 100% |
-| Phase 1 | Enrollment and Health | 100% |
-| Phase 2 | Core Telemetry | 40% |
-| Phase 3 | Detection | 40% |
-| Phase 4 | Investigation | 25% |
-| Phase 5 | Response | 0% |
-| Phase 6 | Deployment | 20% |
-| Phase 7 | Security and Pilots | 0% |
-| Phase 8 | Sustainability | 20% |
-## 18.1 Implemented foundation
-The current implementation includes:
-
-- Event envelope structure.
-- Agent enrollment foundation.
-- Agent health functionality.
-- Agent service-management foundation.
-- Bounded telemetry buffering.
-- Retry and acknowledgement handling.
-- Background token renewal.
-- Separate bootstrap and permanent agent tokens.
-- System and host information collection.
-- Process telemetry collection.
-- Process lifecycle tracking.
-- Authentication telemetry collection.
-- YAML-based detection rules.
-- Alert persistence.
-- Alert toggling.
-- Notification functionality.
-- Dashboard device views.
-- Dashboard event views.
-- Dashboard alert views.
-- Dockerfiles.
-- Docker Compose infrastructure.
-- Initial license and README documentation.
-
-## 18.2 Remaining and planned work
-
-### Foundation
-
-- Complete infrastructure and application foundation.
-- Verify complete ingestion and storage paths.
-
-### Enrollment and health
-
-- Improve health reporting.
-- Add more complete collector-failure visibility.
-- Validate credential renewal and recovery scenarios.
-
-### Core telemetry
-
-- Complete persistence monitoring.
-- Complete file integrity monitoring.
-- Expand network context.
-- Improve collector coverage across operating systems.
-- Verify process hashing and lifecycle completeness.
-
-### Detection
-
-- Improve detection reliability.
-- Add rule versioning.
-- Improve deduplication.
-- Improve idempotency.
-- Improve event correlation.
-- Harden notification processing.
-
-### Investigation
-
-- Add endpoint timelines.
-- Add process-tree visualization.
-- Improve event search.
-- Improve persistence investigation.
-- Add investigation cases.
-
-### Response
-
-- Develop response capabilities.
-- Define authorized endpoint response workflows.
-- Introduce safeguards and auditing before enabling response actions.
-
-### Deployment
-
-- Complete production installation workflows.
-- Add backup and restore procedures.
-- Improve upgrade and migration processes.
-- Define retention configuration.
-- Improve operational monitoring.
-
-### Security and pilots
-
-- Complete TLS implementation.
-- Conduct security assessments.
-- Harden access control.
-- Perform pilot deployments.
-- Validate real-world reliability.
-
-### Sustainability
-
-- Complete documentation.
-- Improve contribution guidelines.
-- Establish release and maintenance processes.
-- Improve project onboarding.
+- **Repository Test Suite:** 118 tests pass across agent (54), backend (45), and worker (19).
+- **Maturity Verdict:** Functional prototype suitable for self-hosted development and testing.
+- **Release-Blocking Items for Production:**
+  1. Worker persistence for process lifecycle events.
+  2. Durable worker processing with manual Kafka offset commits.
+  3. Tenant-scoped ClickHouse schemas and query filters.
+  4. Unified root Docker Compose deployment.
 
 ---
 
 # 19. Roadmap: Future Capabilities
-The long-term direction is to evolve SysMon from an endpoint telemetry collection platform into a more complete EDR solution.
 
-Potential future development areas include:
-
-## 19.1 Advanced endpoint visibility
-
-- More comprehensive process tracking.
-- Improved process lineage.
-- File activity monitoring.
-- Persistence monitoring.
-- Network activity context.
-- Additional operating-system collectors.
-
-## 19.2 Advanced detection
-
-- More extensive detection rules.
-- Cross-event correlation.
-- Behavioral detection.
-- Detection tuning.
-- Improved false-positive management.
-These are possible extensions, not existing product guarantees.
-
-## 19.3 Security investigation
-
-- Endpoint activity timelines.
-- Process relationship graphs.
-- Alert investigation workflows.
-- Search across historical telemetry.
-- Investigation cases.
-
-## 19.4 Endpoint response
-Phase 5 is currently at 0%.
-
-Possible future response capabilities may include controlled endpoint actions, but their scope, authorization model, safety controls, and audit requirements have not yet been finalized.
-
-No active containment or remediation capability should be assumed.
-
-## 19.5 Scalability
-Potential future improvements include:
-
-- Kafka partition optimization.
-- Independent worker scaling.
-- Database query optimization.
-- Retention and archival strategies.
-- Multi-tenant operational scaling.
-- More comprehensive ingestion backpressure.
+- **Phase 1: Pipeline Reliability & Schema Evolution:** Map process events in worker; implement durable Kafka commits; align default port configurations.
+- **Phase 2: Multi-Tenancy & Access Control:** Add `tenant_id` to ClickHouse schemas; implement tenant query scoping; support analyst vs viewer roles.
+- **Phase 3: Deep Endpoint Visibility:** Implement File Integrity Monitoring (FIM); persistence monitoring (cron, systemd, Registry); macOS launchd installer.
+- **Phase 4: Advanced Detection & Forensics:** Dynamic rule hot-reloading; process lineage tree in dashboard; distinct IP tracking; MITRE ATT&CK mapping.
+- **Phase 5: Automated Response:** Authenticated endpoint quarantine and remote process termination.
+- **Phase 6: Production Hardening:** Unified Docker Compose orchestration; automated TLS ingress; database backup/restore workflows.
 
 ---
 
 # 20. Project Principles
-SysMon is guided by the following principles.
 
-### Open-source first
-The project is intended to remain accessible to developers and organizations through an open-source-first approach.
-
-### Self-hosted by design
-Organizations should control their infrastructure and security telemetry without depending on a mandatory cloud platform.
-
-### Lightweight endpoint collection
-The agent should collect useful security information while minimizing unnecessary endpoint overhead.
-
-### Centralized detection
-Detection rules should be managed centrally rather than duplicated across endpoint agents.
-
-### Platform-independent telemetry
-Different operating systems should produce consistent event structures.
-
-### Security by design
-Authentication, tenant isolation, credential management, and secure communication must be considered throughout the architecture.
-
-### Extensibility
-The architecture should allow new collectors, event types, detection rules, storage capabilities, and integrations to be introduced without requiring a complete redesign.
+1. **Self-Hosted First:** Organizations must own and control their security telemetry.
+2. **Transparent Engineering:** Document exact system behavior without exaggerating capabilities.
+3. **Open Standards:** Built on standard formats (JSON, YAML, SQL) and trusted open-source components.
+4. **Resilient Collection:** Endpoints must buffer telemetry locally to survive outages.
+5. **Separation of Concerns:** Clear boundaries between collection, transport, processing, and query visualization.
 
 ---
 
-# 21. Glossary
-| Term | Meaning |
-| --- | --- |
-| EDR | Endpoint Detection and Response |
-| Endpoint | A monitored computer or server |
-| Agent | Software installed on an endpoint |
-| Telemetry | Information collected about system activities |
-| Event | A structured record of an activity |
-| Tenant | An organization using SysMon |
-| Tenant ID | Identifier associated with an organization |
-| Bootstrap Token | Temporary credential used during enrollment |
-| Agent Token | Credential used by an enrolled agent |
-| Token Renewal | Replacement of an expiring credential |
-| Kafka | Distributed event-streaming platform |
-| ClickHouse | Analytical database for large event datasets |
-| FastAPI | Python backend framework |
-| Persistence | Mechanisms that allow execution or access to survive system lifecycle events |
-| Process Lineage | Relationships between parent and child processes |
-| Detection Rule | Logic used to identify potentially suspicious events |
-| Alert | A finding generated by detection logic |
-| TLS | Encryption protocol used to protect network communication |
-| Backpressure | Controlling incoming data when downstream services cannot keep up |
-| Idempotency | Ensuring repeated processing does not create unintended duplicate effects |
-| Deduplication | Identifying and suppressing duplicate records or findings |
-| Correlation | Connecting related events to provide additional security context |
+# 21. Technical Glossary
+
+- **Agent:** The endpoint sensor process collecting telemetry.
+- **Bootstrap Token:** One-time, 30-minute token exchanged during enrollment.
+- **Operational Token:** Rotating 1-hour bearer credential used for ongoing telemetry.
+- **EventEnvelope:** The canonical JSON contract wrapping all telemetry events.
+- **Telemetry Receipt:** SQLite record preventing duplicate Kafka publishing.
+- **Worker:** The Kafka consumer process responsible for storage mapping and rule evaluation.
+- **MergeTree:** The ClickHouse columnar table engine used for telemetry storage.
+- **Valkey:** The Redis-compatible in-memory store used for API rate limiting.
+
 ---
 
 # 22. Frequently Asked Questions
 
-### Is SysMon cloud-based?
-No. SysMon is designed as a self-hosted/on-premises platform. Organizations own their infrastructure and data.
+**Q: Is SysMon ready for production deployment today?**  
+A: No. SysMon is an early functional prototype. While core pipelines work and 118 tests pass, process event persistence, tenant isolation, and durable offset commits are still in progress.
 
-### Does SysMon support multiple organizations?
-The architecture includes tenant identification and logical tenant isolation. Full production multi-tenant readiness remains subject to implementation and security validation.
+**Q: Does SysMon monitor process executions?**  
+A: The agent actively captures process executions, command lines, parent-child PIDs, and SHA-256 hashes. However, the current worker drops these events instead of saving them to ClickHouse. Full persistence is scheduled for Phase 1.
 
-### Does the agent perform detection?
-The selected architecture places detection rules in backend processing workers. The agent primarily collects and transmits telemetry.
+**Q: Does SysMon support multi-tenancy?**  
+A: Only at the metadata level. The agent and envelope support `tenant_id`, but ClickHouse tables and dashboard queries currently operate across the entire fleet without organization isolation.
 
-### What information does the agent collect?
-The current foundation includes system and host information, process telemetry, process lifecycle information, and authentication-related telemetry. Additional collectors are under development.
+**Q: Where is PostgreSQL used?**  
+A: PostgreSQL is not present in the current codebase. Administrative state and credentials are managed in SQLite, while telemetry is stored in ClickHouse.
 
-### What happens when an endpoint loses internet connectivity?
-The selected offline strategy is to continue collecting telemetry, buffer it within configured limits, retry transmission, and process acknowledgements.
-
-### Does SysMon support Windows and Linux?
-The architecture is designed for Windows, Linux, and macOS. Actual feature coverage must be verified against the available platform-specific collectors.
-
-### Does SysMon detect malware?
-SysMon includes a rule-based detection architecture. It should not currently be represented as a complete antivirus or malware sandbox solution.
-
-### Can administrators enroll agents?
-Yes. The project includes a bootstrap-token enrollment flow that exchanges an initial credential for a permanent agent credential.
-
-### Do agents need to restart when tokens expire?
-The implemented background renewal mechanism is designed to replace expiring credentials without requiring a manual agent restart.
-
-### Where is telemetry stored?
-ClickHouse is the intended analytical telemetry store. Other databases are used or planned for operational and application state.
-
-### Is endpoint isolation supported?
-No active endpoint isolation or response capability should be assumed. Response is a future roadmap phase.
-
-### Is SysMon production-ready?
-SysMon is actively under development. Its core architecture and several foundational capabilities exist, but additional telemetry, detection, investigation, security, and deployment work remains.
+**Q: Can I deploy the entire stack with one Docker command?**  
+A: Not yet. You must start the three Compose files in `infra/` (Kafka, ClickHouse, Valkey) and launch the backend and worker processes separately. A unified Compose file is planned.
 
 ---
 
 # 23. Contributing and Project Development
-SysMon is intended to be an extensible open-source project.
 
-Contributors should be able to extend its functionality without tightly coupling every component.
-
-Potential contribution areas include:
-
-- Platform-specific collectors.
-- Event schema improvements.
-- Agent reliability.
-- Backend ingestion.
-- Detection rules.
-- Dashboard improvements.
-- Storage optimization.
-- Documentation.
-- Deployment automation.
-- Security testing.
-Contribution instructions, development setup, coding standards, and release procedures should be maintained in the project repository as they are finalized.
+- **Repository:** `https://github.com/k-txlha/sysmon`
+- **Issue Tracker:** `https://github.com/k-txlha/sysmon/issues`
+- **Running Tests:** Run `python run_tests.py` from repository root.
+- **Code Standards:** Adhere to PEP 8, Pydantic type annotations, and asynchronous FastAPI patterns.
 
 ---
 
-# 24. Documentation Status and Accuracy
-This handbook describes the intended architecture, current functionality, and planned direction of SysMon.
+# 24. Documentation Status and Accuracy Verification
 
-It is a living document.
-
-The following distinctions must be maintained whenever documentation is updated:
-
-- **Implemented:** Functionality verified in the current codebase.
-- **Partially implemented:** The foundation exists, but important functionality or validation remains incomplete.
-- **Planned:** Approved or discussed development work that is not yet fully implemented.
-- **Future consideration:** Potential capabilities that have not yet been finalized.
-The roadmap should be updated whenever significant functionality is completed.
-
-The implementation in the repository takes precedence over illustrative diagrams, examples, and architectural intentions in this document.
-
----
-
-**SysMon — Endpoint visibility, centralized detection, and security telemetry.**
-
-*Open-source first. Self-hosted by design.*
+This handbook is maintained directly against the repository source code and the master technical audit dated 2026-11-06. Status definitions used throughout this documentation:
+- **Available:** Implemented, verified by unit/API tests.
+- **In Development:** Sensor code exists; backend/worker integration actively in progress.
+- **Partially Implemented:** Functional components exist with known edge cases or caveats.
+- **Planned:** Documented in roadmap milestones; implementation not yet started.
+- **Not Implemented:** Not present in the codebase.

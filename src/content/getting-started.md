@@ -1,66 +1,273 @@
-# Installation and first run
+# SysMon Installation & Deployment Guide
 
-This guide separates steps that are runnable in this website checkout from the EDR deployment workflow described in the supplied project handbook. The current workspace contains the Vite website and its assets; it does not contain a SysMon backend, endpoint agent, worker, Docker Compose file, or service configuration.
+This guide covers the verified installation, infrastructure startup, backend configuration, and endpoint agent deployment workflow for SysMon.
 
-## EDR prerequisites
+> **System Maturity Notice:** SysMon is an open-source development prototype. While 118 unit and API tests pass across the repository, there is no single-command root Docker Compose stack. Infrastructure services, backend gateway, processing worker, and dashboard are started as individual components as documented below.
 
-The handbook describes a self-hosted architecture using Python services and endpoint agents, Docker and Docker Compose, Kafka, ClickHouse, PostgreSQL, SQLite, Redis/Valkey, and a web dashboard. Caddy is described as the intended TLS reverse proxy.
+---
 
-Exact supported versions, minimum hardware requirements, operating-system coverage, and the required Compose profiles are not present in this website checkout. Confirm them against the EDR repository before preparing a host.
+## 1. System Requirements & Prerequisites
 
-## Repository setup
+### Server & Infrastructure Requirements
 
-The canonical EDR repository URL is not included in this workspace, so a clone command cannot be provided safely. The checked-out project here is the website: its Vite scripts are in `package.json`, page code is in `src/`, source exports are in `assets/`, and website SVGs are served from `public/assets/`.
+Monitored infrastructure nodes running the backend gateway and analytical pipeline require:
 
-The website's `npm install` and `npm run dev` commands are not substitutes for EDR dependency installation or backend startup instructions.
+| Component | Minimum Specification | Recommended Specification | Notes |
+| :--- | :--- | :--- | :--- |
+| **Operating System** | Linux (Ubuntu 22.04/24.04, Debian 12) or Windows Server | Linux (Ubuntu 24.04 LTS x86_64) | Tested on Linux and Windows |
+| **Python** | Python 3.10 or higher | Python 3.11 / 3.12 | Required for backend, worker, agent |
+| **Container Engine** | Docker 24.0+ & Docker Compose v2 | Latest Docker Engine with Compose | For Kafka, ClickHouse, and Valkey |
+| **Memory (RAM)** | 8 GB RAM | 16 GB RAM | Kafka KRaft (3 brokers) + ClickHouse |
+| **Disk Space** | 20 GB available storage | 100+ GB SSD storage | ClickHouse MergeTree telemetry storage |
 
-For the website only, `VITE_PRODUCT_NAME` changes the displayed product name and `VITE_REPOSITORY_URL` supplies the project link in the documentation portal. These are website build-time settings, not SysMon EDR configuration variables. No canonical repository URL was available when this guide was written.
+### Monitored Endpoint Prerequisites
 
-## Environment configuration and infrastructure
+Monitored client workstations and servers require:
 
-No EDR `.env.example`, Docker Compose configuration, backend settings, database migrations, or service manifests are present in this checkout. Consequently, this guide cannot reliably name EDR environment variables, defaults, secrets, container names, ports, health checks, startup commands, or log commands. Do not copy credentials from examples into a deployment.
+- **Windows:** Windows 10 / 11 or Windows Server 2019+. Python 3.10+. Optional `pywin32` package for Security Event Log access (Event IDs 4624/4625).
+- **Linux:** Ubuntu, Debian, RHEL, or Fedora with systemd. Read access to `/var/log/auth.log` or `journalctl` for PAM/SSH authentication records.
+- **macOS:** macOS 12 (Monterey) or higher. Python 3.10+. (Note: macOS service installer is currently in development; execution runs via terminal process).
 
-The intended architecture assigns telemetry transport to Kafka, analytical events to ClickHouse, structured application state to PostgreSQL, and an earlier administrative-storage role to SQLite. The final ownership and active services must be checked against the deployment files for the exact release being installed.
+---
 
-## Backend, workers, and dashboard
+## 2. Infrastructure Setup (Docker Compose)
 
-The supplied handbook describes a FastAPI ingestion gateway and Kafka-processing workers. It identifies `POST /api/v1/agents/token` as an enrollment endpoint previously discussed, but the application source, route models, worker entry point, API schema, and authentication contract are not present here. The dashboard shown on the website is a design preview, not a live security console.
+SysMon relies on three external infrastructure services configured in the `infra/` directory:
 
-Before starting these services, obtain the EDR repository and verify its documented entry points, configuration examples, health checks, and logs. No backend or worker start command is published here because none can be verified.
+1. **Apache Kafka (KRaft Cluster):** 3 controllers and 3 brokers on ports `29092`, `39092`, `49092`, with Kafka UI on `8080`.
+2. **ClickHouse:** Columnar analytical database on HTTP port `8123` and native port `9000`.
+3. **Valkey:** High-performance Redis-compatible service on port `6379` for API rate-limiting.
 
-## Agent installation by operating system
+Clone the repository and start each stack:
 
-The project handbook describes a Python agent architecture intended for Windows, Linux, and macOS. It does not establish that all collectors or service installers are complete on all platforms.
+```bash
+git clone https://github.com/k-txlha/sysmon.git
+cd sysmon
 
-| Platform | Documentation status |
-| --- | --- |
-| Windows | Agent package, configuration keys, enrollment invocation, Windows service name, and log location require verification against the agent source. |
-| Linux | Package layout, configuration keys, enrollment invocation, systemd unit, and log location require verification against the agent source. |
-| macOS | Collector coverage and launch-service configuration require verification; complete support is not established by this website checkout. |
+# 1. Start Apache Kafka KRaft cluster
+docker compose -f infra/kafka/docker-compose.yaml up -d
 
-Do not install an example service unit or run an enrollment command copied from a different release.
+# 2. Start ClickHouse database
+docker compose -f infra/clickhouse/docker-compose.yaml up -d
 
-## Agent enrollment
+# 3. Start Valkey rate-limiting store
+docker compose -f infra/redis/docker-compose.yaml up -d
+```
 
-The supplied handbook describes a two-stage flow: an administrator creates a short-lived bootstrap credential, the agent exchanges it during enrollment, and the backend issues an agent-specific credential. The route previously documented for this flow is `POST /api/v1/agents/token`.
+Verify that all containers are healthy:
 
-The token-generation procedure, `enroll.py` location and arguments, request and response fields, token storage path, and registration verification method are not available in this checkout. Treat the flow as design documentation until those details are confirmed in the EDR implementation. Never publish or commit real bootstrap or agent tokens.
+```bash
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+```
 
-## Verification checklist
+---
 
-Use the release's deployment instructions to verify each item. This website checkout cannot perform these EDR checks:
+## 3. Backend Gateway Setup
 
-- [ ] Required infrastructure services report healthy.
-- [ ] The FastAPI route is reachable and its OpenAPI schema matches the release.
-- [ ] Kafka accepts telemetry and the intended consumer group is active.
-- [ ] ClickHouse and application-state stores are reachable.
-- [ ] The actual security dashboard is available and connected to its backend.
-- [ ] An agent is enrolled and its service is running.
-- [ ] Telemetry is acknowledged, processed, stored, and visible in the dashboard.
-- [ ] Detection evaluation is enabled and verified where configured.
+The backend is built with FastAPI and runs on Uvicorn. It handles administrator authentication, agent enrollment, telemetry validation, and Kafka event publishing.
 
-## Troubleshooting approach
+### Step 1: Install Python Dependencies
 
-Start with the exact service status and logs for the installed release. Check configuration names against that release's example files, verify network reachability between dependent services, and confirm the agent identity and credential state without printing token values. For an empty event view, distinguish a healthy collector returning no events from a collector error and check ingestion, worker consumption, storage, and dashboard filters in order.
+```bash
+# Recommended: Create a Python virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-This checkout does not define EDR service names or log commands, so it cannot provide release-specific diagnostics or resolutions. Use the project's deployment and agent sources rather than guessing container names, error messages, or command-line options.
+# Install root dependencies (covers backend, worker, and agent)
+pip install -r requirements.txt
+```
+
+### Step 2: Configure Environment Variables
+
+Create `backend/.env` or export environment variables:
+
+```bash
+# Server configuration
+PORT=8000
+ENVIRONMENT=production  # Use 'development' only for local testing without TLS
+
+# Kafka and ClickHouse settings
+KAFKA_BOOTSTRAP_SERVERS=localhost:29092
+KAFKA_TOPIC=telemetry_data
+CLICKHOUSE_HOST=localhost
+CLICKHOUSE_PORT=8123
+CLICKHOUSE_USERNAME=backend
+CLICKHOUSE_PASSWORD=YourSecureClickHousePassword
+CLICKHOUSE_DB=metrics
+
+# Rate limiting
+REDIS_URL=redis://localhost:6379
+
+# Security & CORS
+AUTH_DB_PATH=../data/sysmon_auth.db
+AUTH_SESSION_COOKIE_SECURE=true
+ALLOWED_ORIGINS=https://dashboard.yourdomain.com
+```
+
+### Step 3: Start the Backend Server
+
+```bash
+python -m backend
+```
+
+The gateway starts on `http://0.0.0.0:8000` (or configured TLS ports).
+
+---
+
+## 4. Processing Worker Setup
+
+The worker is a background Python process that consumes telemetry from Kafka, validates envelopes, persists supported records to ClickHouse, evaluates YAML detection rules, and dispatches alerts.
+
+> **Configuration Warning:** ClickHouse Compose exposes HTTP port `8123`. The worker configuration defaults to `8443` unless explicitly overridden. Ensure `CLICKHOUSE_PORT=8123` is exported before launching the worker.
+
+```bash
+# Export worker environment overrides
+export CLICKHOUSE_HOST=localhost
+export CLICKHOUSE_PORT=8123
+export CLICKHOUSE_USERNAME=backend
+export CLICKHOUSE_PASSWORD=YourSecureClickHousePassword
+export CLICKHOUSE_DB=metrics
+export KAFKA_BOOTSTRAP_SERVERS=localhost:29092
+export KAFKA_TOPIC=telemetry_data
+
+# Optional alert notification webhooks
+export SLACK_WEBHOOK_URL="https://hooks.slack.com/services/..."
+export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+
+# Start the worker consumer
+python -m worker.main
+```
+
+At startup, the worker connects to ClickHouse, initializes the `MergeTree` tables (`DEVICES`, `EVENTS`, `ALERTS`, `AGENT_HEALTH`), loads all enabled YAML rules from `worker/detection/rules/`, and joins the Kafka consumer group.
+
+---
+
+## 5. Administrative Account Setup
+
+Before accessing the dashboard or generating agent tokens, you must create the primary administrator account.
+
+### Option A: Local Loopback REST Setup
+
+The setup endpoint `POST /api/v1/auth/setup` is restricted to local loopback clients (`127.0.0.1` or `::1`) and rejects forwarded proxy headers:
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/v1/auth/setup \
+  -H "Content-Type: application/json" \
+  -d '{"username": "admin", "password": "YourStrongPassword123!"}'
+```
+
+### Option B: Interactive CLI Recovery Tool
+
+If deploying remotely without local browser access, use the included administrator recovery CLI:
+
+```bash
+python -m backend.auth_recovery
+```
+
+Follow the interactive prompts to initialize or reset administrator credentials. The tool hashes passwords with Argon2id and revokes any existing active sessions.
+
+---
+
+## 6. Dashboard Frontend Setup
+
+The dashboard is a React 19 single-page application built with Vite.
+
+```bash
+cd dashboard
+
+# Install dependencies (requires Node.js 20.19.0+ or >=22.12.0)
+npm install
+
+# For local development:
+npm run dev
+
+# For production build:
+npm run build
+```
+
+The production build generates static assets in `dashboard/dist/`. A production Dockerfile and Nginx reverse proxy configuration are included in `dashboard/Dockerfile` and `dashboard/nginx.conf`.
+
+---
+
+## 7. Endpoint Agent Setup & Enrollment
+
+Endpoints are enrolled using a two-stage credential exchange. Agents never receive hardcoded permanent credentials.
+
+### Step 1: Generate a Bootstrap Token
+
+From the dashboard or using your administrator session cookie:
+
+```bash
+curl -X POST http://localhost:8000/api/v1/agents/token \
+  -H "Cookie: sysmon_admin_session=<YOUR_ADMIN_SESSION>" \
+  -H "X-CSRF-Token: <YOUR_CSRF_TOKEN>" \
+  -H "Content-Type: application/json" \
+  -d '{"description": "Enrollment for WORKSTATION-01"}'
+```
+
+The server returns a one-time bootstrap token valid for 30 minutes.
+
+### Step 2: Enroll the Endpoint Agent
+
+On the target endpoint machine, run the enrollment CLI:
+
+```bash
+# Run enrollment handshake
+python -m agent.enroll \
+  --token <BOOTSTRAP_TOKEN> \
+  --backend https://backend.yourdomain.com:8000
+```
+
+The CLI contacts the backend, exchanges the bootstrap token, receives a server-assigned `agent_id` and a 1-hour operational bearer token, and writes the configuration atomically to `agent/.env` with `0600` file permissions.
+
+### Step 3: Run the Agent
+
+To test the agent in interactive mode:
+
+```bash
+python -m agent.main
+```
+
+### Step 4: Install as an Operating System Service
+
+SysMon includes service helpers in `agent/service.py`:
+
+- **Linux (systemd):**
+  ```bash
+  sudo python -m agent.service install
+  sudo systemctl start sysmon-agent
+  sudo systemctl status sysmon-agent
+  ```
+- **Windows (Task Scheduler):**
+  ```powershell
+  python -m agent.service install
+  ```
+- **macOS:**
+  Configure a standard launchd daemon plist pointing to `python -m agent.main` with working directory set to the agent installation path.
+
+---
+
+## 8. Post-Installation Verification Checklist
+
+Verify your end-to-end installation using the following checks:
+
+- [ ] **Health Endpoint:** Query `GET http://localhost:8000/health`. Verify that `status` is `healthy` or `degraded` and Kafka/ClickHouse report connected.
+- [ ] **Test Suite:** Execute `python run_tests.py` from repository root. Verify all 118 unit tests pass (54 agent, 45 backend, 19 worker).
+- [ ] **ClickHouse Device Record:** Query ClickHouse to verify the enrolled agent appears in the `DEVICES` table:
+  ```bash
+  docker exec -it clickhouse-server clickhouse-client --query "SELECT agent_id, hostname, ip_address, updated_at FROM metrics.DEVICES FORMAT Pretty;"
+  ```
+- [ ] **Agent Log Verification:** Inspect `agent.log` to confirm telemetry envelopes are being sent and returning HTTP `202 Accepted`.
+- [ ] **Detection Rule Test:** Generate 5 consecutive failed SSH/logon attempts on an enrolled host within 60 seconds. Verify an alert is created in `metrics.ALERTS` and appears in the dashboard threat view.
+
+---
+
+## 9. Troubleshooting & Common Issues
+
+| Symptom | Probable Cause | Recommended Resolution |
+| :--- | :--- | :--- |
+| **Agent returns HTTP 426 Upgrade Required** | Plain HTTP transport was used in production mode. | Configure valid TLS certificates on the backend or set `TLS_TERMINATED=true` if behind a trusted TLS reverse proxy. |
+| **Worker logs ClickHouse Connection Refused** | Default port mismatch between Compose (8123) and worker (8443). | Export `CLICKHOUSE_PORT=8123` before starting `worker.main`. |
+| **Admin setup returns HTTP 403 Forbidden** | Setup request originated from a remote non-loopback IP. | Run setup directly from the server host on `127.0.0.1` or execute `python -m backend.auth_recovery`. |
+| **Kafka broker connection timeout** | Kafka KRaft brokers still completing quorum election. | Allow 15–30 seconds after `docker compose up` before starting backend or worker processes. |
+| **Agent logs "Event dropped: buffer full"** | Endpoint was offline longer than buffer capacity. | Increase `SIEM_BUFFER_MAX_EVENTS` (default 25,000) or `SIEM_BUFFER_MAX_BYTES` (default 50 MiB) in `agent/.env`. |

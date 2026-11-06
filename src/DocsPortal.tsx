@@ -419,9 +419,9 @@ function DocumentationHome({
           <ArchitectureDiagram />
         </section>
         <aside className="docs-home-note">
-          <span>ACCURACY NOTE</span>
-          <h3>Living documentation, honest status.</h3>
-          <p>This portal is based on the supplied development handbook. The current website checkout does not include EDR backend, agent, or deployment sources, so implementation details and roadmap claims are not independently verified here.</p>
+          <span>ACCURACY AUDIT</span>
+          <h3>Living documentation, verified status.</h3>
+          <p>This portal is maintained directly against the repository source code and the master technical audit dated 2026-11-06 (118 verified tests passing). Implementation details, active endpoints, and roadmap milestones are verified against current code.</p>
           <a href="/docs/contributing/documentation-status">How status is reported <span aria-hidden="true">→</span></a>
         </aside>
       </div>
@@ -491,14 +491,14 @@ function DocArticle({
         </header>
         {page.source === "installation" && (
           <div className="docs-accuracy-callout" role="note">
-            <span>!</span>
-            <p>SysMon is actively under development. Platform-specific installation instructions and deployment requirements are being validated. Detailed setup guides will be published as they become available.</p>
+            <span>✓</span>
+            <p><strong>Verified Setup Procedures:</strong> This guide documents the actual startup steps for Kafka KRaft, ClickHouse, Valkey, FastAPI backend, worker consumer, and agent enrollment CLI based on the master technical audit.</p>
           </div>
         )}
         {page.slug === "api-reference/overview" && (
           <div className="docs-accuracy-callout" role="note">
-            <span>!</span>
-            <p><strong>Route reported by the handbook; source not present.</strong> Request models, responses, authentication requirements, and errors need verification in the FastAPI application.</p>
+            <span>✓</span>
+            <p><strong>FastAPI OpenAPI Inventory:</strong> All 30 mounted operations across 8 routers are documented with their HTTP methods, paths, request headers, bodies, response schemas, and verification statuses.</p>
           </div>
         )}
         {page.slug === "architecture/overview" && <ArchitectureDiagram />}
@@ -629,6 +629,12 @@ export default function DocsPortal() {
       <header className="docs-topbar">
         <ProductMark />
         <div className="docs-topbar-right">
+          <nav className="docs-topbar-nav" aria-label="Main site sections">
+            <a href="/product">Product</a>
+            <a href="/features">Features</a>
+            <a href="/architecture">Architecture</a>
+            <a href="/roadmap">Roadmap</a>
+          </nav>
           <button className="docs-search-trigger" onClick={() => setSearchOpen(true)} type="button">
             <span aria-hidden="true">⌕</span><span>Search documentation...</span><kbd>/</kbd>
           </button>

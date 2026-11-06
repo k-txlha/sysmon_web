@@ -34,8 +34,8 @@ export const docsCategories: DocsCategory[] = [
     pages: [
       {
         slug: "getting-started/installation",
-        title: "Installation",
-        description: "What is currently verifiable for the website and EDR setup.",
+        title: "Installation & Deployment",
+        description: "Verified prerequisites, Compose infrastructure, backend, worker, and agent setup.",
         source: "installation",
       },
     ],
@@ -173,8 +173,8 @@ export const docsCategories: DocsCategory[] = [
     pages: [
       {
         slug: "api-reference/overview",
-        title: "API and communication",
-        description: "The enrollment route documented in the supplied handbook.",
+        title: "API Reference (30 Routes)",
+        description: "Complete inventory of all 30 active FastAPI endpoints across 8 routers with request/response schemas.",
         chapters: [15],
       },
     ],

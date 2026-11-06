@@ -36,7 +36,13 @@
 .docs-brand > span { font-size: 17px; font-weight: 700; letter-spacing: -.045em; }
 .docs-brand i { width: 1px; height: 20px; margin: 0 3px; background: #c5c9cc; }
 .docs-brand b { font-size: 12px; font-weight: 500; color: #647184; }
-.docs-topbar-right { display: flex; align-items: center; gap: 25px; }
+.docs-topbar-right { display: flex; align-items: center; gap: 20px; }
+.docs-topbar-nav { display: flex; align-items: center; gap: 16px; font-size: 11px; font-weight: 500; }
+.docs-topbar-nav a { color: #3b4859; transition: color 140ms ease; }
+.docs-topbar-nav a:hover { color: var(--docs-blue); }
+@media (max-width: 900px) {
+  .docs-topbar-nav { display: none; }
+}
 .docs-search-trigger {
   width: min(320px, 30vw);
   height: 36px;
